@@ -517,7 +517,8 @@ class Gemma4DecoderLayer(JaxModule):
                  mesh: Mesh,
                  kv_cache_dtype: str,
                  quant_config: VllmQuantConfig,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 activation_dtype: Optional[jnp.dtype] = None):
         text_config: Gemma4TextConfig = config.hf_config.text_config
         rms_norm_eps = text_config.rms_norm_eps
         hidden_size = text_config.hidden_size
@@ -557,7 +558,7 @@ class Gemma4DecoderLayer(JaxModule):
         self.post_attention_layernorm = JaxRmsNorm(
             hidden_size,
             epsilon=rms_norm_eps,
-            dtype=dtype,
+            dtype=activation_dtype if activation_dtype is not None else dtype,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
@@ -567,7 +568,7 @@ class Gemma4DecoderLayer(JaxModule):
         self.pre_feedforward_layernorm = JaxRmsNorm(
             hidden_size,
             epsilon=rms_norm_eps,
-            dtype=dtype,
+            dtype=activation_dtype if activation_dtype is not None else dtype,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
@@ -594,7 +595,7 @@ class Gemma4DecoderLayer(JaxModule):
         self.post_feedforward_layernorm = JaxRmsNorm(
             hidden_size,
             epsilon=rms_norm_eps,
-            dtype=dtype,
+            dtype=activation_dtype if activation_dtype is not None else dtype,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
@@ -760,6 +761,19 @@ class Gemma4Model(JaxModule):
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
         text_config = hf_config.text_config
+        activation_dtype = (vllm_config.additional_config or {}).get(
+            "activation_dtype")
+        if activation_dtype not in (None, "float32"):
+            raise ValueError("Gemma4 activation_dtype must be 'float32' or unset")
+        if activation_dtype is not None:
+            if getattr(text_config, "enable_moe_block", False):
+                raise ValueError("Gemma4 FP32 activation state does not support MoE")
+            if getattr(text_config, "hidden_size_per_layer_input", 0) > 0:
+                raise ValueError("Gemma4 FP32 activation state does not support PLE")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("Gemma4 FP32 activation state requires PP=1")
+        self.activation_dtype = (jnp.float32
+                                 if activation_dtype == "float32" else None)
         vocab_size = model_config.get_vocab_size()
         dtype = model_config.dtype
         rms_norm_eps = text_config.rms_norm_eps
@@ -869,6 +883,7 @@ class Gemma4Model(JaxModule):
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.layers.{layer_index}",
+                activation_dtype=self.activation_dtype,
             ))
 
         if self.is_last_rank:
@@ -968,9 +983,13 @@ class Gemma4Model(JaxModule):
 
         if inputs_embeds is not None:
             x = inputs_embeds
+            if self.activation_dtype is not None:
+                x = x.astype(self.activation_dtype)
         else:
             x = self.embed_tokens(input_ids)
-            # Gemma4: Apply embedding scaling
+            if self.activation_dtype is not None:
+                x = x.astype(self.activation_dtype)
+            # Gemma4: Apply embedding scaling after promoting gathered rows.
             x = x * self.embedding_scale
 
         # PLE: compute per_layer_inputs once; slice [T, layer_idx, :] per layer.
