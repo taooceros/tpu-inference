@@ -1,0 +1,58 @@
+{
+  "format": 1,
+  "source_commit": "20c83c18189b18d7898b615814bec0479eb981d4",
+  "source_repository": "admission-control-vllm local research snapshot",
+  "owner": "tpu-inference",
+  "workspace_files": [
+    {
+      "path": "admission_control/tpu/__init__.py",
+      "sha256": "1ed1e3caedad78952793ab4cbe6642847511cc727f9b66cec6b2d84c8809b2cc",
+      "bytes": 676
+    },
+    {
+      "path": "admission_control/tpu/measurement_worker.py",
+      "sha256": "a5756df2aec0ee33ea047d7b1099cfaee8acae66dda987c52b89348a71bba0da",
+      "bytes": 997
+    },
+    {
+      "path": "admission_control/tpu/placement.py",
+      "sha256": "16de7faedbb2c1e00c7d502b748f51abdee025e28a4dc00a6d05b65592df9be6",
+      "bytes": 7213
+    },
+    {
+      "path": "admission_control/tpu/topology.py",
+      "sha256": "773205ce6cc029199e9271de7bf569024f7340b512bb1c51b99b0764f05caafb",
+      "bytes": 12216
+    },
+    {
+      "path": "admission_control/tpu/xla_profiler.py",
+      "sha256": "1fb3c03636eed66b935d4cd388bbff6fff1fc41747a0f83f5d703c4c360a7033",
+      "bytes": 10247
+    },
+    {
+      "path": "hetero/tpu_worker.py",
+      "sha256": "55fce2ed6d9e92536006cc1bdafdd975a767a609835e51fae67b2eba03ef9c63",
+      "bytes": 25146
+    },
+    {
+      "path": "pkg_util/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "pkg_util/diag_cluster.py",
+      "sha256": "0190ca881e5776438e0b17cb7c1d3fc5974d38d678517d5279251442911eba44",
+      "bytes": 823
+    },
+    {
+      "path": "pkg_util/test_selector.py",
+      "sha256": "f8b621006b01789a86d933d085c2f86a1f53ac4c46c35631f27cfac070b4f34c",
+      "bytes": 868
+    },
+    {
+      "path": "pkg_util/tpu_topology.py",
+      "sha256": "a05cd23751388032cce0e8eb785959de824a4ce65e39ff4babbcd055aa51d3bd",
+      "bytes": 1515
+    }
+  ]
+}

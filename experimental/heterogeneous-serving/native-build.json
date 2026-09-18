@@ -1,0 +1,85 @@
+{
+  "format": 1,
+  "integration": "exact-measured-native-base",
+  "upstream_repository": "https://github.com/vllm-project/tpu-inference",
+  "upstream_base_commit": "8d31f0866147d394dafce923c7cce090a862ad70",
+  "native_patch_commit": "fcfc099747be87fba355fc79e7534f8147c3d98b",
+  "native_files": [
+    {
+      "path": "tpu_inference/models/jax/gemma4.py",
+      "upstream_sha256": "5b93b3b3dd5d42374c0115a4523661ed584191fb0cb9fc9639ae2248b3896fbd",
+      "current_sha256": "12cc23c006277164a2c665d818bcf343149dbd77e75298951c48a9b1a9122e7f",
+      "measured_runtime_sha256": "12cc23c006277164a2c665d818bcf343149dbd77e75298951c48a9b1a9122e7f"
+    }
+  ],
+  "historical_patch_manifest": {
+    "workspace_path": "hetero/native_backend_patch.json",
+    "sha256": "148b4295bf83c0eaa473b11fff5c7c643092f1873200cef1f52b07a2265861ed",
+    "unchanged": true
+  },
+  "paired_native_bases": {
+    "vllm": "0ba2aa35a81dcc3246b26291368b53fa2389c7d7",
+    "tpu_inference": "8d31f0866147d394dafce923c7cce090a862ad70"
+  },
+  "api_compatibility": {
+    "basis": "Source correspondence with preserved measured runtime; not a latest-main port or complete local import/inference test.",
+    "native_files": [
+      {
+        "path": "tpu_inference/worker/tpu_worker.py",
+        "sha256": "0d43478fa1c104773ca3fa2e4a0bdcf0f7bd2c06a5aa2a14a0c910dee458262e",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "tpu_inference/runner/tpu_runner.py",
+        "sha256": "8d1e8d996e734212fe03244b4355d595f16b6aa6d8fa0da5686b3c84d12e2c66",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "tpu_inference/layers/common/sharding.py",
+        "sha256": "c9026dd8515aa4c60387434b7621b84b97ffff11576afbe591a6dd3874f7f038",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "tpu_inference/utils.py",
+        "sha256": "5347de18a10333a87ecf9a0c69881fb104eaa613e3e86ba43a14970a97538139",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "tpu_inference/layers/jax/norm.py",
+        "sha256": "8b0e969f77209f2c3da1d26f9a653e9c689d909553adeece96511cd56a8eab67",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "tpu_inference/layers/jax/embed.py",
+        "sha256": "dfbef8f419254e3736b5feeb73e51afb7a6c53aea78c824e0d4a6459041805ad",
+        "matches_preserved_runtime": true
+      }
+    ],
+    "copied_runtime_files_verified": 10,
+    "copied_runtime_modified": false
+  },
+  "migration_verification": {
+    "status": "passed",
+    "backend": "cpu",
+    "jax": "0.10.2",
+    "flax": "0.12.4",
+    "checks": [
+      "CacheDType Pydantic accepts FP32 and rejects float64",
+      "Gemma4 rejects unsupported dtype, MoE, PLE, PP",
+      "zero-layer native Gemma4Model gathered and supplied embeddings retain BF16 parameters and produce FP32 activations",
+      "three actual decoder norm constructors preserve BF16 weights with FP32 outputs",
+      "unset activation dtype retains BF16 behavior"
+    ],
+    "limitations": "AST-extracted native classes and constructor statements; CPU primitive smoke, not full imports, model execution, TPU kernels, distributed serving, or hardware requalification"
+  },
+  "assembly": {
+    "orchestrator": "https://github.com/taooceros/llm-d/tree/research/heterogeneous-tpu-20260918/experimental/heterogeneous-serving",
+    "layout": "Use the llm-d assembly tool to reproduce flat workspace paths from sibling forks. Do not treat this subtree as an independently installable Python package.",
+    "source_manifest": "migration.json"
+  },
+  "qualification": {
+    "hardware_runs_performed_during_migration": false,
+    "claim": "Historical physical qualification belongs to the original frozen research runtime and evidence. Byte-identical native sources and CPU checks do not newly qualify these fork builds.",
+    "unsupported": "No latest-main API compatibility claim; no full dependency import/build, model deployment, TPU kernels, Ray actor launch or distributed scheduling exercised during migration. Gemma4 FP32 activation mode rejects MoE, PLE and PP != 1."
+  }
+}

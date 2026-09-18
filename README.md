@@ -1131,3 +1131,28 @@ A huge thank you to everyone who has helped build and improve `vllm-project/tpu-
 - For discussing with fellow users, use the [TPU support topic in the vLLM Forum](https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27)
 - For coordinating contributions and development, use the [Developer Slack](https://join.slack.com/share/enQtOTY2OTUxMDIyNjY1OS00M2MxYWQwZjAyMGZjM2MyZjRjNTA0ZjRkNjkzOTRhMzg0NDM2OTlkZDAxOTAzYmJmNzdkNDc4OGZjYTUwMmRh)
 - For collaborations and partnerships, contact us at [vllm-tpu@google.com](mailto:vllm-tpu@google.com)
+
+## Experimental heterogeneous TPU serving research
+
+The [research subtree](experimental/heterogeneous-serving/) preserves the measured
+TPU worker, topology, placement, and profiling modules at their original workspace
+paths. The native [Gemma4 implementation](tpu_inference/models/jax/gemma4.py) accepts
+`additional_config={"activation_dtype": "float32"}` while retaining BF16 parameters:
+gathered/supplied embeddings and three decoder normalization outputs use FP32.
+The default is unchanged; FP32 activation mode rejects MoE, PLE, and PP other than 1.
+
+This branch starts at the measured upstream commit
+`8d31f0866147d394dafce923c7cce090a862ad70`, not current upstream main.
+[Migration provenance](experimental/heterogeneous-serving/migration.json) records
+original paths and hashes; [native build metadata](experimental/heterogeneous-serving/native-build.json)
+records the paired vLLM base, original/current native hashes, and CPU smoke results.
+The native patch is byte-identical to the measured source. Six worker/runner/primitive
+API files also match the preserved runtime. CPU JAX/Flax checks execute extracted native
+zero-layer embedding and normalization paths, BF16 parameter/FP32 output behavior,
+unchanged BF16 behavior, and rejection guards; they do not exercise TPU attention.
+
+Use the [llm-d experimental orchestrator](https://github.com/taooceros/llm-d/tree/research/heterogeneous-tpu-20260918/experimental/heterogeneous-serving)
+to assemble the sibling fork payloads into the original flat workspace. This subtree
+is not independently installable. Historical hardware results apply to the original
+frozen runtime, not a newly qualified fork build. No complete dependency import/build,
+model deployment, TPU workload, or distributed serving run was performed here.
