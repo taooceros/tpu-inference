@@ -45,6 +45,11 @@
       "bytes": 38179
     },
     {
+      "path": "hetero/load_profile.py",
+      "sha256": "10d52a94fc9d5062a1acb3aed47254081761e6b508d8bb39267a21ae362eadbe",
+      "bytes": 11243
+    },
+    {
       "path": "hetero/preread.py",
       "sha256": "316f6bfb8a9bcc18e0c29debf443975136dad3d8ddddd59bea47c9fae0cc1149",
       "bytes": 36429
@@ -61,8 +66,8 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "aad85b646b3d093f5a99ba456e5e41da6cc931a50472db5daf275b28694b4749",
-      "bytes": 58130
+      "sha256": "0e6a5a0b7f16714dc51c1ab3e435747c549ca2fc8c86493bcab610d5d90a69af",
+      "bytes": 58687
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -113,6 +118,11 @@
       "path": "tests/test_exec_bank.py",
       "sha256": "d5876faac3b40013093961869a691530d51cec48f15061635197e61590a56a87",
       "bytes": 32005
+    },
+    {
+      "path": "tests/test_load_profile.py",
+      "sha256": "cd8819c7c3f29f0af6b7b38cc02c204f231d9648c37d4b7eb55622e96903aecb",
+      "bytes": 2840
     },
     {
       "path": "tests/test_preread.py",

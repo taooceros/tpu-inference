@@ -354,7 +354,14 @@ class HeteroTPUWorker(TPUWorker):
                 stats = self.__dict__.setdefault("_omp_normal_load", _new_load_stats())
                 try:
                     with _checkpoint_clock(stats, self.__dict__.setdefault("_omp_phase_clocks", {})):
-                        result = self._timed("load_model", super().load_model)
+                        if payload.get("profile_load", False):
+                            from .load_profile import LoadProfile
+
+                            with LoadProfile(sample_stacks=getattr(self, "rank", None) == 0) as profile:
+                                result = self._timed("load_model", super().load_model)
+                            self._omp_load_profile = profile.evidence()
+                        else:
+                            result = self._timed("load_model", super().load_model)
                 finally:
                     nnx.eval_shape = original_eval_shape
         self.omp_precision_evidence = self._verify_model_precision()
@@ -744,6 +751,8 @@ class HeteroTPUWorker(TPUWorker):
                               else {"mode": None}),
                 "startup_profiles": self.__dict__.get("_omp_startup_profiles", {}),
                 "phases": self.__dict__.get("_omp_phase_clocks", {}),
+                **({"load_profile": self._omp_load_profile}
+                   if "_omp_load_profile" in self.__dict__ else {}),
                 "compile_cache": {
                     "dir": cache_dir,
                     "min_compile_time_secs": jax.config.jax_persistent_cache_min_compile_time_secs,
