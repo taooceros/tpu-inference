@@ -151,9 +151,110 @@ class HeteroTPUWorker(TPUWorker):
         return result
 
     def load_model(self):
-        result = self._timed("load_model", super().load_model)
+        mode = self._hetero_payload().get("weight_snapshot", "off")
+        self.omp_snapshot_status = {
+            "mode": mode, "restored": False,
+            "verified_checksums": self._hetero_payload().get("weight_snapshot_verify", True),
+        }
+        if mode == "read":
+            result = self._timed("load_model", self._load_snapshot_or_normal)
+        else:
+            result = self._timed("load_model", super().load_model)
         self.omp_precision_evidence = self._verify_model_precision()
+        if mode == "write":
+            self.omp_snapshot_status["snapshot"] = self.omp_snapshot_weights()
         return result
+
+    def _snapshot_location(self):
+        from pathlib import Path
+        payload = self._hetero_payload()
+        return Path("/dev/shm/omp_weights") / payload["layout_id"] / payload["instance_id"] / f"rank{self.omp_process_rank}"
+
+    def _snapshot_context(self):
+        from .weight_snapshot import model_identity
+        payload = self._hetero_payload()
+        config = self.vllm_config.model_config
+        return {
+            **model_identity(config.model),
+            "tp_size": payload["tp_size"],
+            "dtype": str(config.dtype).removeprefix("torch."),
+            "quantization": getattr(config, "quantization", None),
+            "backend_revision": payload["backend_revision"],
+            "runtime_revision": payload["runtime_revision"],
+            "host_ips": payload["host_ips"],
+            "chip_coords_by_host": payload["chip_coords_by_host"],
+        }
+
+    def omp_snapshot_weights(self):
+        from .weight_snapshot import snapshot
+        report = self._timed("snapshot_write", snapshot, self._snapshot_location(),
+                             self.model_runner.state, self._snapshot_context())
+        return {"executor_rank": self.rank, "process_rank": self.omp_process_rank,
+                "node_ip": self.omp_node_ip, **report}
+
+    def _load_snapshot_or_normal(self):
+        """Restore before closure capture, without an inference-step hook.
+
+        All processes vote before loader/placement so one invalid host cannot
+        enter normal checkpoint collectives while its peers take another path.
+        The load-time builder patch is removed unconditionally.
+        """
+        import logging
+        import jax
+        import numpy as np
+        from flax import nnx
+        from jax.experimental import multihost_utils
+        from tpu_inference.models.common import model_loader
+        from .weight_snapshot import SnapshotRefused, prepare, restore, validate_tree
+
+        clocks = self.__dict__.setdefault("_omp_phase_clocks", {})
+        runner = self.model_runner
+        configured_dtype = runner.model_config.dtype
+        error = None
+        prepared = None
+        try:
+            prepared = prepare(self._snapshot_location(), self._snapshot_context(),
+                               runner.mesh, clocks,
+                               verify_checksums=self.omp_snapshot_status["verified_checksums"])
+        except Exception as exc:
+            error = str(exc)
+
+        def agree(local_error):
+            votes = multihost_utils.process_allgather(np.int32(local_error is None))
+            if not np.all(votes):
+                raise SnapshotRefused(local_error or "another worker refused its snapshot")
+
+        original_builder = model_loader._get_nnx_model
+
+        def snapshot_builder(model_class, config, rng, mesh, pooler=None, is_draft_model=False):
+            problem = None
+            abstract = None
+            try:
+                if is_draft_model or config.model_config.quantization is not None:
+                    raise SnapshotRefused("draft/quantized snapshot graph construction is unsupported")
+                with jax.set_mesh(mesh):
+                    abstract = nnx.eval_shape(lambda: model_class(config, rng, mesh))
+                validate_tree(nnx.state(abstract), mesh, prepared)
+            except Exception as exc:
+                problem = str(exc)
+            agree(problem)
+            restored = restore(nnx.state(abstract), mesh, prepared, clocks)
+            nnx.update(abstract, restored)
+            self.omp_snapshot_status["restored"] = True
+            return abstract
+
+        try:
+            agree(error)
+            model_loader._get_nnx_model = snapshot_builder
+            return super().load_model()
+        except SnapshotRefused as exc:
+            self.omp_snapshot_status.update(restored=False, fallback_reason=str(exc))
+            logging.getLogger(__name__).warning("weight snapshot refused; normal loader: %s", exc)
+            runner.model_config.dtype = configured_dtype
+            model_loader._get_nnx_model = original_builder
+            return super().load_model()
+        finally:
+            model_loader._get_nnx_model = original_builder
 
     def _verify_model_precision(self) -> Dict[str, Any]:
         """Inspect once after loading, before cache allocation and captured execution."""
@@ -317,11 +418,13 @@ class HeteroTPUWorker(TPUWorker):
             "devices": getattr(self, "omp_device_evidence", {}),
             "native_backend": getattr(self, "omp_backend_evidence", {}),
             "precision": getattr(self, "omp_precision_evidence", {}),
+            "weight_snapshot": getattr(self, "omp_snapshot_status", {}),
         }
 
     def omp_init_phases(self) -> Dict[str, Any]:
         """Collective-RPC entry point: wall-clock start/end of each start-up phase."""
         return {"executor_rank": getattr(self, "rank", None),
+                "weight_snapshot": getattr(self, "omp_snapshot_status", {}),
                 "phases": self.__dict__.get("_omp_phase_clocks", {})}
 
     def omp_kv_cache_evidence(self) -> Dict[str, Any]:

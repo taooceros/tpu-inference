@@ -31,8 +31,13 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "53a91665b4cecaddfb3a74c31321f9ddf2f9cb32c7936e02f47f05de3d161e28",
-      "bytes": 28567
+      "sha256": "89b336ca5c37be0dc5f6ca3f437fedd18af2876114aaf0f2e6822d762d267ac6",
+      "bytes": 33375
+    },
+    {
+      "path": "hetero/weight_snapshot.py",
+      "sha256": "6e4eed7d4add3a968b785d3daa72391af406c8b07e66a90cd203359069cb0368",
+      "bytes": 9370
     },
     {
       "path": "pkg_util/__init__.py",
@@ -53,6 +58,11 @@
       "path": "pkg_util/tpu_topology.py",
       "sha256": "a05cd23751388032cce0e8eb785959de824a4ce65e39ff4babbcd055aa51d3bd",
       "bytes": 1515
+    },
+    {
+      "path": "tests/test_weight_snapshot.py",
+      "sha256": "079f6de94294241f959cde5cafbc1fd66c845f38b9382be64219d04d2f80ba0f",
+      "bytes": 5838
     }
   ]
 }
