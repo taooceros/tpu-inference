@@ -331,19 +331,54 @@ class HeteroTPUWorker(TPUWorker):
 
         return cache_layout(self.model_runner)
 
-    def omp_export_blocks(self, addressing: Dict[str, Any]) -> Dict[str, Any]:
-        """Export native pages; caller must drain and exclude concurrent execution."""
-        from .kv_transport import export_blocks
+    def _omp_kv_staging(self) -> Dict[Any, Any]:
+        staging = getattr(self, "_omp_kv_staging_state", None)
+        if staging is None:
+            staging = self._omp_kv_staging_state = {}
+        return staging
 
-        return export_blocks(self.model_runner, addressing)
+    def omp_export_gather(self, transaction_id: str, addressing: Dict[str, Any],
+                          start: int, budget_bytes: int, notifier: Any) -> Dict[str, Any]:
+        """Device gather of one chunk; caller must drain and exclude execution.
 
-    def omp_import_blocks(
-        self, addressing: Dict[str, Any], payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Populate native-reserved pages, never allocate request blocks here."""
-        from .kv_transport import import_blocks
+        Host staging continues on a background thread and reports to notifier.
+        """
+        from .kv_transport import export_gather
 
-        return import_blocks(self.model_runner, addressing, payload)
+        return export_gather(self.model_runner, self._omp_kv_staging(), transaction_id,
+                             addressing, start, budget_bytes, notifier)
+
+    def omp_import_advance(self, transaction_id: str, commit: bool, start: int,
+                           budget_bytes: int, notifier: Any,
+                           addressing: Optional[Dict[str, Any]] = None,
+                           payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Scatter a staged chunk and/or queue the next; caller must drain execution."""
+        from .kv_transport import import_advance
+
+        return import_advance(self.model_runner, self._omp_kv_staging(), transaction_id,
+                              commit=commit, start=start, budget_bytes=budget_bytes,
+                              notifier=notifier, addressing=addressing, payload=payload)
+
+    def omp_kv_discard(self, transaction_id: str) -> bool:
+        from .kv_transport import discard
+
+        discard(self._omp_kv_staging(), transaction_id)
+        return True
+
+    def omp_kv_debug(self) -> Dict[str, Any]:
+        """Background transport thread stacks and staging progress, for fail-closed errors."""
+        import sys
+        import threading
+        import traceback
+
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        stacks = {names[ident]: "".join(traceback.format_stack(frame)[-12:])
+                  for ident, frame in sys._current_frames().items()
+                  if names.get(ident, "").startswith("omp-kv")}
+        staging = {str(key): {k: v for k, v in value.items()
+                              if k in ("cursor", "pending", "progress", "error")}
+                   for key, value in self._omp_kv_staging().items() if isinstance(value, dict)}
+        return {"hostname": socket.gethostname(), "threads": stacks, "staging": staging}
 
     def omp_resume_fenced_request_state(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Restore authoritative token history before native resumed scheduling.
