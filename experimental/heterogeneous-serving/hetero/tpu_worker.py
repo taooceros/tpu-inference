@@ -77,6 +77,12 @@ class HeteroTPUWorker(TPUWorker):
 
     def initialize_from_config(self, *args, **kwargs):  # type: ignore[override]
         verify_compile_cache(self._omp_compile_cache_expected)
+        kv_cache_config = args[0] if args else kwargs["kv_cache_config"]
+        self._omp_kv_num_blocks = kv_cache_config.num_blocks
+        bank = self._exec_bank()
+        if bank is not None and bank.mode == "write":
+            # Before the sampling/logprobs precompile below, so those buckets are captured too.
+            bank.start_capture(self.model_runner, _runner_modules())
         # tpu_inference.worker.tpu_worker.TPUWorker.initialize_from_config runs the
         # sampling / gather_logprobs AOT precompile and its warm-up pass *before* the
         # KV cache allocation; sub-clocks separate compile from allocation.
@@ -94,16 +100,59 @@ class HeteroTPUWorker(TPUWorker):
             originals.append((owner, attr, original))
             setattr(owner, attr, lambda *a, _c=clock, _f=original, **k: self._timed(_c, _f, *a, **k))
         try:
-            return self._startup_profiled("initialize_from_config", super().initialize_from_config,
-                                         *args, **kwargs)
+            result = self._startup_profiled("initialize_from_config", super().initialize_from_config,
+                                            *args, **kwargs)
         finally:
             for owner, attr, original in originals:
                 setattr(owner, attr, original)
+        if bank is not None and bank.mode == "read":
+            # After KV allocation: the identity includes num_blocks and the cache arrays.
+            self._timed("exec_bank_load", bank.load, self.model_runner, _runner_modules(),
+                        self._exec_bank_identity)
+        return result
 
     def compile_or_warm_up_model(self, *args, **kwargs):  # type: ignore[override]
         verify_compile_cache(self._omp_compile_cache_expected)
-        return self._startup_profiled("compile_or_warm_up_model", super().compile_or_warm_up_model,
-                                     *args, **kwargs)
+        result = self._startup_profiled("compile_or_warm_up_model", super().compile_or_warm_up_model,
+                                        *args, **kwargs)
+        bank = self._exec_bank()
+        if bank is not None and bank.mode == "write":
+            try:
+                self._timed("exec_bank_write", bank.finish_capture, self._exec_bank_identity)
+            except Exception as exc:  # a provisioning failure is evidence, not a serving failure
+                bank.status["write_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    def _exec_bank(self):
+        """This worker's WorkerBank, or None when the engine runs without a bank."""
+        payload = self._hetero_payload()
+        mode = payload.get("exec_bank")
+        if mode is None:
+            return None
+        bank = self.__dict__.get("_omp_exec_bank")
+        if bank is None:
+            from .exec_bank import WorkerBank
+            bank = WorkerBank(mode, payload["exec_bank_dir"], instance_id=payload["instance_id"],
+                              nonce=payload["exec_bank_nonce"], process_rank=self.omp_process_rank,
+                              process_count=len(payload["host_ips"]),
+                              sabotage_rank=payload.get("exec_bank_sabotage_rank"))
+            self._omp_exec_bank = bank
+        return bank
+
+    def _exec_bank_identity(self):
+        from .exec_bank import engine_identity, runner_file_digests, runtime_identity
+        return engine_identity(self.model_runner, self._hetero_payload(),
+                               backend_revision=BACKEND_REVISION, runtime_revision=RUNTIME_REVISION,
+                               runtime=runtime_identity(), files=runner_file_digests(),
+                               num_blocks=self._omp_kv_num_blocks)
+
+    def omp_exec_bank_report(self) -> Dict[str, Any]:
+        """Collective RPC: bank status plus per-function hit/miss/rejection counters."""
+        bank = self.__dict__.get("_omp_exec_bank")
+        return {"executor_rank": getattr(self, "rank", None),
+                "process_rank": getattr(self, "omp_process_rank", None),
+                "node_ip": getattr(self, "omp_node_ip", None),
+                **(bank.report() if bank is not None else {"mode": None})}
 
     def _startup_profiled(self, name, call, *args, **kwargs):
         payload = self._hetero_payload()
@@ -249,7 +298,16 @@ class HeteroTPUWorker(TPUWorker):
         # TPUWorker imports JAX before this instance payload is applied. Updating
         # os.environ alone cannot change JAX's already-initialized config states.
         self._omp_compile_cache_expected = configure_compile_cache(self.omp_intended_env)
+        gate = payload.get("prespawn_gate")
+        if gate:
+            # Pre-spawned: everything above ran next to the TPU-owning source engine; park here,
+            # immediately before the first device touch (TPUWorker.init_device -> jax.devices()).
+            from .prespawn import park_and_wait
+
+            self._omp_prespawn_gate = self._timed("prespawn_gate", park_and_wait, gate, local_ip)
         result = self._timed("init_device", super().init_device, *args, **kwargs)
+        if gate:
+            self._omp_prespawn_gate["devices_ready_at"] = time.time()
         verify_compile_cache(self._omp_compile_cache_expected)
 
         self.omp_effective_env = {k: os.environ.get(k) for k in EVIDENCE_ENV_KEYS}
@@ -591,6 +649,10 @@ class HeteroTPUWorker(TPUWorker):
         cache_dir = jax.config.jax_compilation_cache_dir
         return {"executor_rank": getattr(self, "rank", None),
                 "weight_snapshot": getattr(self, "omp_snapshot_status", {}),
+                **({"prespawn_gate": self._omp_prespawn_gate} if "_omp_prespawn_gate" in self.__dict__
+                   else {}),
+                "exec_bank": (self._omp_exec_bank.report() if "_omp_exec_bank" in self.__dict__
+                              else {"mode": None}),
                 "startup_profiles": self.__dict__.get("_omp_startup_profiles", {}),
                 "phases": self.__dict__.get("_omp_phase_clocks", {}),
                 "compile_cache": {
@@ -819,6 +881,14 @@ class HeteroTPUWorker(TPUWorker):
         del runner.requests[request_id]
         del records[request_id]
         return {"request_id": request_id, "aborted": True}
+
+
+def _runner_modules() -> Dict[str, Any]:
+    """tpu_inference modules whose jit callables the executable bank replaces."""
+    from tpu_inference.layers.jax.sample import sampling
+    from tpu_inference.runner import compilation_manager, tpu_runner
+    return {"tpu_runner": tpu_runner, "compilation_manager": compilation_manager,
+            "sampling": sampling}
 
 
 def _box_dims(coords: Sequence[Any]) -> tuple:
