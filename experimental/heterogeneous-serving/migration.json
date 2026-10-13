@@ -46,8 +46,8 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "85ab62ea2c5a93ff81f3dcea7c9cd434d146ce24cb3e0191d3753491bf8dc4a7",
-      "bytes": 43080
+      "sha256": "cc26772b75d63218a109bb6a3fbd02f6f86c0a52bdf8e307e3d0a83d25314fde",
+      "bytes": 43357
     },
     {
       "path": "hetero/weight_snapshot.py",

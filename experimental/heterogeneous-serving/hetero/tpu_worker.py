@@ -236,6 +236,9 @@ class HeteroTPUWorker(TPUWorker):
             raise RuntimeError("unsupported worker matmul_precision")
         if self.vllm_config.cache_config.cache_dtype != payload.get("kv_cache_dtype"):
             raise RuntimeError("worker cache dtype does not match the engine configuration")
+        if payload.get("kv_cache_dtype") not in ("bfloat16", "float32"):
+            # "auto" skips the native quantize_kv cast: float32 k/v would meet a bfloat16 cache in RPA.
+            raise RuntimeError("native Gemma4 backend requires kv_cache_dtype bfloat16 or float32")
         import jax
 
         # Set before native runner construction or any model tracing, not in a
