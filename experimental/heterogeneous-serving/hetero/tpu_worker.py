@@ -18,6 +18,7 @@ this correct regardless of Ray's environment-variable copy allowlist.
 from __future__ import annotations
 
 import os
+import time
 import socket
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -50,6 +51,29 @@ EVIDENCE_ENV_KEYS = (
 
 class HeteroTPUWorker(TPUWorker):
     """TPU worker bound to one logical serving instance's execution domain."""
+
+    # Engine start-up phases are timed for the reconfiguration-cost breakdown.
+    # Explicit overrides, not __getattribute__: worker attributes are on the step path.
+    def _timed(self, name, call, *args, **kwargs):
+        started = time.time()
+        try:
+            return call(*args, **kwargs)
+        finally:
+            # Not "omp_init_phases": an instance attribute of that name would shadow the RPC method.
+            self.__dict__.setdefault("_omp_phase_clocks", {})[name] = {
+                "start": started, "end": time.time()}
+
+    def determine_available_memory(self, *args, **kwargs):  # type: ignore[override]
+        return self._timed("determine_available_memory", super().determine_available_memory,
+                           *args, **kwargs)
+
+    def initialize_from_config(self, *args, **kwargs):  # type: ignore[override]
+        return self._timed("initialize_from_config", super().initialize_from_config,
+                           *args, **kwargs)
+
+    def compile_or_warm_up_model(self, *args, **kwargs):  # type: ignore[override]
+        return self._timed("compile_or_warm_up_model", super().compile_or_warm_up_model,
+                           *args, **kwargs)
 
     def _hetero_payload(self) -> Dict[str, Any]:
         additional = getattr(self.vllm_config, "additional_config", None) or {}
@@ -120,14 +144,14 @@ class HeteroTPUWorker(TPUWorker):
         # Set before native runner construction or any model tracing, not in a
         # thread-local context that expires before the execution thread runs.
         jax.config.update("jax_default_matmul_precision", additional["matmul_precision"])
-        result = super().init_device(*args, **kwargs)
+        result = self._timed("init_device", super().init_device, *args, **kwargs)
 
         self.omp_effective_env = {k: os.environ.get(k) for k in EVIDENCE_ENV_KEYS}
         self.omp_device_evidence = self._collect_device_evidence(payload)
         return result
 
     def load_model(self):
-        result = super().load_model()
+        result = self._timed("load_model", super().load_model)
         self.omp_precision_evidence = self._verify_model_precision()
         return result
 
@@ -294,6 +318,11 @@ class HeteroTPUWorker(TPUWorker):
             "native_backend": getattr(self, "omp_backend_evidence", {}),
             "precision": getattr(self, "omp_precision_evidence", {}),
         }
+
+    def omp_init_phases(self) -> Dict[str, Any]:
+        """Collective-RPC entry point: wall-clock start/end of each start-up phase."""
+        return {"executor_rank": getattr(self, "rank", None),
+                "phases": self.__dict__.get("_omp_phase_clocks", {})}
 
     def omp_kv_cache_evidence(self) -> Dict[str, Any]:
         """Reports the worker-side KV cache shape actually allocated."""

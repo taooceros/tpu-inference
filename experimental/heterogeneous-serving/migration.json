@@ -31,8 +31,8 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "ce500a9488df7d7df748008fa6e6240cb371ad75000d22e4796fd90774bc03d2",
-      "bytes": 27035
+      "sha256": "53a91665b4cecaddfb3a74c31321f9ddf2f9cb32c7936e02f47f05de3d161e28",
+      "bytes": 28567
     },
     {
       "path": "pkg_util/__init__.py",
