@@ -50,6 +50,20 @@ class CompileCacheConfig(unittest.TestCase):
         self.assertEqual(jax.config.jax_persistent_cache_min_compile_time_secs, 2.5)
         self.assertFalse(jax.config.jax_log_compiles)
 
+    def test_every_layout_process_applies_zero_thresholds(self):
+        from hetero.layout import BUILTIN_LAYOUTS, builtin_layout, resolve_layout
+        from tests.test_staged_transition import inventory
+
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", 7)
+        for layout_id in BUILTIN_LAYOUTS:
+            for instance in resolve_layout(inventory(), builtin_layout(layout_id)).instances:
+                expected = configure_compile_cache(instance.process_env(0))
+                self.assertEqual(expected, {"jax_persistent_cache_min_compile_time_secs": 0.0,
+                                            "jax_persistent_cache_min_entry_size_bytes": 0})
+                self.assertEqual((jax.config.jax_persistent_cache_min_compile_time_secs,
+                                  jax.config.jax_persistent_cache_min_entry_size_bytes), (0.0, 0))
+
 
 class CoverageMatchedAcceptance(unittest.TestCase):
     def setUp(self):

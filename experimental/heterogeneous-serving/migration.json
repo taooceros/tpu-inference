@@ -46,8 +46,8 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "cc26772b75d63218a109bb6a3fbd02f6f86c0a52bdf8e307e3d0a83d25314fde",
-      "bytes": 43357
+      "sha256": "60783407d0b85c30bf8d6fd0a304ffdefcc81e0707419f4a3a8d305234255dbf",
+      "bytes": 43768
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -76,8 +76,8 @@
     },
     {
       "path": "tests/test_compile_cache.py",
-      "sha256": "2761f223fab96c7b85fb352c59134571258deeb662fa6cfb73b0bde210e951ba",
-      "bytes": 5479
+      "sha256": "7993cfb97411e962531d2eeedb9a5cfd900972039afa4b971777cf3c4e13ca1b",
+      "bytes": 6426
     },
     {
       "path": "tests/test_compile_overlap.py",

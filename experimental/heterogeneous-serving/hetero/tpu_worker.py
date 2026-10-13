@@ -27,7 +27,8 @@ import ray
 
 from tpu_inference.worker.tpu_worker import TPUWorker  # type: ignore
 
-from .native_backend import BACKEND_REVISION, RUNTIME_REVISION, verify_backend
+from .native_backend import (BACKEND_REVISION, RUNTIME_REVISION, effective_activation_dtype,
+                             verify_backend)
 from .compile_cache import configure_compile_cache, verify_compile_cache
 
 EVIDENCE_ENV_KEYS = (
@@ -230,9 +231,10 @@ class HeteroTPUWorker(TPUWorker):
         for field in ("activation_dtype", "matmul_precision"):
             if additional.get(field) != payload.get(field):
                 raise RuntimeError(f"worker {field} does not match the engine configuration")
-        if additional.get("activation_dtype") != "float32":
-            raise RuntimeError("native Gemma4 FP32-state backend requires activation_dtype=float32")
-        if additional.get("matmul_precision") not in ("default", "high", "highest"):
+        if additional.get("activation_dtype") not in (None, "float32"):
+            # Unset: the native model keeps the model dtype (full bf16 state).
+            raise RuntimeError("native Gemma4 backend requires activation_dtype float32 or unset")
+        if additional.get("matmul_precision") not in ("default", "highest"):
             raise RuntimeError("unsupported worker matmul_precision")
         if self.vllm_config.cache_config.cache_dtype != payload.get("kv_cache_dtype"):
             raise RuntimeError("worker cache dtype does not match the engine configuration")
@@ -446,8 +448,11 @@ class HeteroTPUWorker(TPUWorker):
         if len(roots) != 1:
             raise RuntimeError(f"expected one native Gemma4 text backbone, found {len(roots)}")
         root = roots[0]
-        activation_dtype = str(jnp.dtype(root.activation_dtype))
-        if activation_dtype != payload["activation_dtype"]:
+        # The native patch leaves root.activation_dtype None when the override is
+        # unset; activations then run in the model dtype.
+        activation_dtype = (configured_dtype if root.activation_dtype is None
+                            else str(jnp.dtype(root.activation_dtype)))
+        if activation_dtype != effective_activation_dtype(payload["activation_dtype"], configured_dtype):
             raise RuntimeError("native model activation dtype differs from requested dtype")
         norm_dtypes = Counter()
         attention_dtypes = Counter()
