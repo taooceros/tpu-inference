@@ -30,9 +30,19 @@
       "bytes": 10247
     },
     {
+      "path": "hetero/compile_cache.py",
+      "sha256": "24eb95b607e1b8d5434f1f936740a015dc3c4770c179e316c3407c47525d13ff",
+      "bytes": 1406
+    },
+    {
+      "path": "hetero/compile_overlap.py",
+      "sha256": "4a8f0eb46b8cc56ccce3506e2363ebbb17c0a8ef4cc7ab80cdc7eae4cf17f922",
+      "bytes": 13311
+    },
+    {
       "path": "hetero/tpu_worker.py",
-      "sha256": "89b336ca5c37be0dc5f6ca3f437fedd18af2876114aaf0f2e6822d762d267ac6",
-      "bytes": 33375
+      "sha256": "da3b8c88e7c536332ed16c9c4d271bba31632159aee1cc146fb0cb1307139751",
+      "bytes": 38646
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -58,6 +68,16 @@
       "path": "pkg_util/tpu_topology.py",
       "sha256": "a05cd23751388032cce0e8eb785959de824a4ce65e39ff4babbcd055aa51d3bd",
       "bytes": 1515
+    },
+    {
+      "path": "tests/test_compile_cache.py",
+      "sha256": "2761f223fab96c7b85fb352c59134571258deeb662fa6cfb73b0bde210e951ba",
+      "bytes": 5479
+    },
+    {
+      "path": "tests/test_compile_overlap.py",
+      "sha256": "63fab178d6182579322b9d3f694d135744a162ddee436a4ae9e4867e0bbdcad8",
+      "bytes": 8736
     },
     {
       "path": "tests/test_weight_snapshot.py",

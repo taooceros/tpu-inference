@@ -27,6 +27,7 @@ import ray
 from tpu_inference.worker.tpu_worker import TPUWorker  # type: ignore
 
 from .native_backend import BACKEND_REVISION, RUNTIME_REVISION, verify_backend
+from .compile_cache import configure_compile_cache, verify_compile_cache
 
 EVIDENCE_ENV_KEYS = (
     "TPU_MULTIHOST_BACKEND",
@@ -44,6 +45,11 @@ EVIDENCE_ENV_KEYS = (
     "CLOUD_TPU_TASK_ID",
     "JAX_PLATFORMS",
     "JAX_COMPILATION_CACHE_DIR",
+    "VLLM_XLA_CACHE_PATH",
+    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+    "JAX_LOG_COMPILES",
+    "JAX_EXPLAIN_CACHE_MISSES",
     "VLLM_ENABLE_V1_MULTIPROCESSING",
     "OMP_HETERO_INSTANCE_ID",
 )
@@ -68,12 +74,82 @@ class HeteroTPUWorker(TPUWorker):
                            *args, **kwargs)
 
     def initialize_from_config(self, *args, **kwargs):  # type: ignore[override]
-        return self._timed("initialize_from_config", super().initialize_from_config,
-                           *args, **kwargs)
+        verify_compile_cache(self._omp_compile_cache_expected)
+        return self._startup_profiled("initialize_from_config", super().initialize_from_config,
+                                     *args, **kwargs)
 
     def compile_or_warm_up_model(self, *args, **kwargs):  # type: ignore[override]
-        return self._timed("compile_or_warm_up_model", super().compile_or_warm_up_model,
-                           *args, **kwargs)
+        verify_compile_cache(self._omp_compile_cache_expected)
+        return self._startup_profiled("compile_or_warm_up_model", super().compile_or_warm_up_model,
+                                     *args, **kwargs)
+
+    def _startup_profiled(self, name, call, *args, **kwargs):
+        payload = self._hetero_payload()
+        bundle = payload.get("startup_compile_bundle")
+        trace = payload.get("startup_device_trace", False)
+        if not payload.get("startup_profile", False) and not bundle and not trace:
+            return self._timed(name, call, *args, **kwargs)
+        import jax
+        import shutil
+        import tempfile
+        from contextlib import ExitStack
+        from tpu_inference.runner import kv_cache_manager
+        from .compile_overlap import StartupProfile, summarize_device_trace
+        profile = StartupProfile()
+        manager = getattr(self.model_runner, "compilation_manager", None)
+        marker = "omp-startup:" + name
+        directory = tempfile.mkdtemp(prefix="omp-overlap-trace-") if trace else None
+        tracing = False
+        setup_start = start = time.time()
+        setup_s = 0.0
+        try:
+            if trace:
+                options = jax.profiler.ProfileOptions()
+                options.python_tracer_level = 0
+                options.host_tracer_level = 2
+                jax.profiler.start_trace(directory, profiler_options=options)
+                tracing = True
+                setup_s = time.time() - setup_start
+            start = time.time()
+            with ExitStack() as stack:
+                stack.enter_context(profile.hooks(manager=manager, allocation_module=kv_cache_manager))
+                if bundle:
+                    from pathlib import Path
+                    from scripts.overlap_replay import capture
+                    stack.enter_context(capture(Path(bundle) / payload["instance_id"] / name))
+                if trace:
+                    stack.enter_context(jax.profiler.TraceAnnotation(marker))
+                result = self._timed(name, call, *args, **kwargs)
+                if name == "initialize_from_config":
+                    jax.block_until_ready(self.model_runner.kv_caches)
+                return result
+        finally:
+            end = time.time()
+            report = profile.report(start, end)
+            from jax._src import distributed
+            report["pjrt_process_index"] = jax.process_index()
+            report["cache_writer_process_id"] = distributed.global_state.process_id
+            report["compilation_cache_dir"] = jax.config.jax_compilation_cache_dir
+            report["persistent_cache_min_compile_time_secs"] = jax.config.jax_persistent_cache_min_compile_time_secs
+            report["persistent_cache_min_entry_size_bytes"] = jax.config.jax_persistent_cache_min_entry_size_bytes
+            report["jax_version"] = jax.__version__
+            report["trace_options"] = ({"python_tracer_level": options.python_tracer_level,
+                                         "host_tracer_level": options.host_tracer_level} if trace else None)
+            report["host"] = self.omp_hostname
+            report["node_ip"] = self.omp_node_ip
+            report["pid"] = os.getpid()
+            export_start = time.time()
+            try:
+                if tracing:
+                    jax.profiler.stop_trace()
+                    report["device_trace"] = summarize_device_trace(directory, marker)
+            finally:
+                if directory:
+                    shutil.rmtree(directory)
+                if trace:
+                    report["trace_diagnostic_setup_s"] = setup_s
+                    report["trace_diagnostic_export_parse_cleanup_s"] = time.time() - export_start
+                self.__dict__.setdefault("_omp_startup_profiles", {})[name] = report
 
     def _hetero_payload(self) -> Dict[str, Any]:
         additional = getattr(self.vllm_config, "additional_config", None) or {}
@@ -144,7 +220,11 @@ class HeteroTPUWorker(TPUWorker):
         # Set before native runner construction or any model tracing, not in a
         # thread-local context that expires before the execution thread runs.
         jax.config.update("jax_default_matmul_precision", additional["matmul_precision"])
+        # TPUWorker imports JAX before this instance payload is applied. Updating
+        # os.environ alone cannot change JAX's already-initialized config states.
+        self._omp_compile_cache_expected = configure_compile_cache(self.omp_intended_env)
         result = self._timed("init_device", super().init_device, *args, **kwargs)
+        verify_compile_cache(self._omp_compile_cache_expected)
 
         self.omp_effective_env = {k: os.environ.get(k) for k in EVIDENCE_ENV_KEYS}
         self.omp_device_evidence = self._collect_device_evidence(payload)
@@ -422,10 +502,27 @@ class HeteroTPUWorker(TPUWorker):
         }
 
     def omp_init_phases(self) -> Dict[str, Any]:
-        """Collective-RPC entry point: wall-clock start/end of each start-up phase."""
+        """Report startup clocks and the compile-cache configuration actually used."""
+        import jax
+        from jax._src import distributed
+
+        verify_compile_cache(self._omp_compile_cache_expected)
+        cache_dir = jax.config.jax_compilation_cache_dir
         return {"executor_rank": getattr(self, "rank", None),
                 "weight_snapshot": getattr(self, "omp_snapshot_status", {}),
-                "phases": self.__dict__.get("_omp_phase_clocks", {})}
+                "startup_profiles": self.__dict__.get("_omp_startup_profiles", {}),
+                "phases": self.__dict__.get("_omp_phase_clocks", {}),
+                "compile_cache": {
+                    "dir": cache_dir,
+                    "min_compile_time_secs": jax.config.jax_persistent_cache_min_compile_time_secs,
+                    "min_entry_size_bytes": jax.config.jax_persistent_cache_min_entry_size_bytes,
+                    "log_compiles": jax.config.jax_log_compiles,
+                    "explain_cache_misses": jax.config.jax_explain_cache_misses,
+                    "writer_process_id": distributed.global_state.process_id,
+                    "hostname": getattr(self, "omp_hostname", None),
+                    "node_ip": getattr(self, "omp_node_ip", None),
+                    "pid": os.getpid(),
+                }}
 
     def omp_kv_cache_evidence(self) -> Dict[str, Any]:
         """Reports the worker-side KV cache shape actually allocated."""
