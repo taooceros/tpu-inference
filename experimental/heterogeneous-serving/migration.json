@@ -40,9 +40,14 @@
       "bytes": 13311
     },
     {
+      "path": "hetero/restore_graph.py",
+      "sha256": "844c977db66303024e8e4d32098d5409833b332dfbbd92b8d5805a531b344a63",
+      "bytes": 6135
+    },
+    {
       "path": "hetero/tpu_worker.py",
-      "sha256": "a7efcf444a02e20f5135cd7426fa25fd9f500cca7a652a99d192ef9e32f659ec",
-      "bytes": 40457
+      "sha256": "85ab62ea2c5a93ff81f3dcea7c9cd434d146ce24cb3e0191d3753491bf8dc4a7",
+      "bytes": 43080
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -78,6 +83,16 @@
       "path": "tests/test_compile_overlap.py",
       "sha256": "63fab178d6182579322b9d3f694d135744a162ddee436a4ae9e4867e0bbdcad8",
       "bytes": 8736
+    },
+    {
+      "path": "tests/test_restore_graph.py",
+      "sha256": "26bb7f21aec5576213f899671e582fec4992cfcd3b17013fa1b21fa076e56eec",
+      "bytes": 6447
+    },
+    {
+      "path": "tests/test_restore_tail_worker.py",
+      "sha256": "f8d24ff86e664be7959eae8242468823fb50f50ff4b9b34d187c77b06af09a6d",
+      "bytes": 11332
     },
     {
       "path": "tests/test_weight_snapshot.py",

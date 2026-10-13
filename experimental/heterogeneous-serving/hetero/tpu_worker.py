@@ -17,6 +17,7 @@ this correct regardless of Ray's environment-variable copy allowlist.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import socket
@@ -75,8 +76,28 @@ class HeteroTPUWorker(TPUWorker):
 
     def initialize_from_config(self, *args, **kwargs):  # type: ignore[override]
         verify_compile_cache(self._omp_compile_cache_expected)
-        return self._startup_profiled("initialize_from_config", super().initialize_from_config,
-                                     *args, **kwargs)
+        # tpu_inference.worker.tpu_worker.TPUWorker.initialize_from_config runs the
+        # sampling / gather_logprobs AOT precompile and its warm-up pass *before* the
+        # KV cache allocation; sub-clocks separate compile from allocation.
+        manager = self.model_runner.compilation_manager
+        runner = self.model_runner
+        targets = [
+            (manager, "_precompile_sampling", "precompile_sampling"),
+            (manager, "_precompile_gather_logprobs", "precompile_gather_logprobs"),
+            (manager, "_flush_compilations", "precompile_flush"),
+            (runner, "initialize_kv_cache", "kv_cache_allocate"),
+        ]
+        originals = []
+        for owner, attr, clock in targets:
+            original = getattr(owner, attr)
+            originals.append((owner, attr, original))
+            setattr(owner, attr, lambda *a, _c=clock, _f=original, **k: self._timed(_c, _f, *a, **k))
+        try:
+            return self._startup_profiled("initialize_from_config", super().initialize_from_config,
+                                         *args, **kwargs)
+        finally:
+            for owner, attr, original in originals:
+                setattr(owner, attr, original)
 
     def compile_or_warm_up_model(self, *args, **kwargs):  # type: ignore[override]
         verify_compile_cache(self._omp_compile_cache_expected)
@@ -231,16 +252,35 @@ class HeteroTPUWorker(TPUWorker):
         return result
 
     def load_model(self):
-        mode = self._hetero_payload().get("weight_snapshot", "off")
+        from .restore_graph import cheap_tracer_sharding_errors
+        payload = self._hetero_payload()
+        mode = payload.get("weight_snapshot", "off")
+        fast_graph = bool(payload.get("fast_graph", False))
         self.omp_snapshot_status = {
             "mode": mode, "restored": False,
-            "checksums_requested": self._hetero_payload().get("weight_snapshot_verify", True),
+            "checksums_requested": payload.get("weight_snapshot_verify", True),
             "verified_checksums": False, "verified_bytes": 0,
+            "fast_graph": fast_graph,
         }
-        if mode == "read":
-            result = self._timed("load_model", self._load_snapshot_or_normal)
-        else:
-            result = self._timed("load_model", super().load_model)
+        # Both loaders trace the model constructor with nnx.eval_shape (restore: the
+        # snapshot builder below; normal: model_loader._get_nnx_model). The patch only
+        # shortens an AttributeError message that flax swallows, so it wraps the whole
+        # load and nothing executed on the device changes.
+        graph_patch = cheap_tracer_sharding_errors() if fast_graph else contextlib.nullcontext()
+        with graph_patch:
+            if mode == "read":
+                result = self._timed("load_model", self._load_snapshot_or_normal)
+            else:
+                from flax import nnx
+                # The normal loader builds its abstract graph inside _get_nnx_model.
+                # Time the same eval_shape boundary as restore, without checkpoint I/O.
+                original_eval_shape = nnx.eval_shape
+                nnx.eval_shape = lambda *a, **k: self._timed(
+                    "graph_build", original_eval_shape, *a, **k)
+                try:
+                    result = self._timed("load_model", super().load_model)
+                finally:
+                    nnx.eval_shape = original_eval_shape
         self.omp_precision_evidence = self._verify_model_precision()
         if mode == "write":
             self.omp_snapshot_status["snapshot"] = self.omp_snapshot_weights()
@@ -322,24 +362,28 @@ class HeteroTPUWorker(TPUWorker):
         original_builder = model_loader._get_nnx_model
 
         def snapshot_builder(model_class, config, rng, mesh, pooler=None, is_draft_model=False):
+            # From the vote to here: get_model / model registry imports / loader set-up.
+            clocks["loader_entry"] = {"start": entered["at"], "end": time.time()}
             problem = None
             abstract = None
             try:
                 if is_draft_model or config.model_config.quantization is not None:
                     raise SnapshotRefused("draft/quantized snapshot graph construction is unsupported")
                 with jax.set_mesh(mesh):
-                    abstract = nnx.eval_shape(lambda: model_class(config, rng, mesh))
-                validate_tree(nnx.state(abstract), mesh, prepared)
+                    abstract = self._timed("graph_build", nnx.eval_shape,
+                                           lambda: model_class(config, rng, mesh))
+                self._timed("graph_validate", validate_tree, nnx.state(abstract), mesh, prepared)
             except Exception as exc:
                 problem = str(exc)
-            agree(problem)
+            self._timed("graph_agree", agree, problem)
             restored = restore(nnx.state(abstract), mesh, prepared, clocks)
-            nnx.update(abstract, restored)
+            self._timed("graph_update", nnx.update, abstract, restored)
             self.omp_snapshot_status["restored"] = True
             return abstract
 
+        entered = {}
         try:
-            agree(error)
+            self._timed("snapshot_agree", agree, error)
             vote_start = time.time()
             manifest = prepared[0]
             generation = bytes.fromhex(manifest['generation']) if manifest['version'] == 2 else bytes(16)
@@ -349,6 +393,7 @@ class HeteroTPUWorker(TPUWorker):
             if not np.all(epochs == epochs[0]):
                 raise SnapshotRefused("mixed snapshot generations across workers")
             self.omp_snapshot_status['generation'] = manifest.get('generation')
+            entered["at"] = time.time()
             model_loader._get_nnx_model = snapshot_builder
             return super().load_model()
         except SnapshotRefused as exc:
