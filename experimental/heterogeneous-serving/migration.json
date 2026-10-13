@@ -56,8 +56,8 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "8b96ef64ce176ef3c1ebdb5b78c5fa5554f1ed397f2a4ba0aed7d00481dd16d9",
-      "bytes": 47696
+      "sha256": "7b6300b1a368fb357a33217fbbe611683a76d62777041e24e10d895fdc6ad240",
+      "bytes": 53505
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -96,8 +96,8 @@
     },
     {
       "path": "tests/test_exec_bank.py",
-      "sha256": "2680a19a54f40d944422025393b40afde2ff511cacc8ed2bd6ca26745b3abab8",
-      "bytes": 29549
+      "sha256": "d5876faac3b40013093961869a691530d51cec48f15061635197e61590a56a87",
+      "bytes": 32005
     },
     {
       "path": "tests/test_prespawn.py",

@@ -340,8 +340,10 @@ class HeteroTPUWorker(TPUWorker):
                 original_eval_shape = nnx.eval_shape
                 nnx.eval_shape = lambda *a, **k: self._timed(
                     "graph_build", original_eval_shape, *a, **k)
+                stats = self.__dict__.setdefault("_omp_normal_load", _new_load_stats())
                 try:
-                    result = self._timed("load_model", super().load_model)
+                    with _checkpoint_clock(stats, self.__dict__.setdefault("_omp_phase_clocks", {})):
+                        result = self._timed("load_model", super().load_model)
                 finally:
                     nnx.eval_shape = original_eval_shape
         self.omp_precision_evidence = self._verify_model_precision()
@@ -352,7 +354,8 @@ class HeteroTPUWorker(TPUWorker):
     def _snapshot_location(self):
         from pathlib import Path
         payload = self._hetero_payload()
-        return Path("/dev/shm/omp_weights") / payload["layout_id"] / payload["instance_id"] / f"rank{self.omp_process_rank}"
+        return (Path(payload["weight_snapshot_root"]) / payload["layout_id"] / payload["instance_id"]
+                / f"rank{self.omp_process_rank}")
 
     def _snapshot_context(self):
         from .weight_snapshot import model_identity
@@ -649,6 +652,7 @@ class HeteroTPUWorker(TPUWorker):
         cache_dir = jax.config.jax_compilation_cache_dir
         return {"executor_rank": getattr(self, "rank", None),
                 "weight_snapshot": getattr(self, "omp_snapshot_status", {}),
+                **({"normal_load": self._omp_normal_load} if "_omp_normal_load" in self.__dict__ else {}),
                 **({"prespawn_gate": self._omp_prespawn_gate} if "_omp_prespawn_gate" in self.__dict__
                    else {}),
                 "exec_bank": (self._omp_exec_bank.report() if "_omp_exec_bank" in self.__dict__
@@ -881,6 +885,116 @@ class HeteroTPUWorker(TPUWorker):
         del runner.requests[request_id]
         del records[request_id]
         return {"request_id": request_id, "aborted": True}
+
+
+# Normal-loader weight conversion/placement functions, timed by _checkpoint_clock (tpu_inference @
+# 8d31f0866): models/jax/utils/weight_utils.py:742 jax_array_from_reshaped_torch (torch reshape/permute
+# + t2j on the JAX CPU backend; the safetensors tensors are lazy mmaps, so the checkpoint bytes are read
+# here, as page faults) and :769 assign_and_shard_param (shard_put -> make_array_from_callback: local
+# shard selection on the host + H2D).  layers/jax/quantization/unquantized.py:42 imports both by name.
+_LOADER_HOOKS = (("tpu_inference.models.jax.utils.weight_utils", "jax_array_from_reshaped_torch", "host_convert_s"),
+                 ("tpu_inference.models.jax.utils.weight_utils", "assign_and_shard_param", "shard_place_s"),
+                 ("tpu_inference.layers.jax.quantization.unquantized", "jax_array_from_reshaped_torch", "host_convert_s"),
+                 ("tpu_inference.layers.jax.quantization.unquantized", "assign_and_shard_param", "shard_place_s"))
+
+
+def _new_load_stats() -> Dict[str, Any]:
+    return {"tensors": 0, "bytes": 0, "read_s": 0.0, "host_convert_s": 0.0, "shard_place_s": 0.0,
+            "host_convert_calls": 0, "shard_place_calls": 0, "host_convert_nested_calls": 0,
+            "shard_place_nested_calls": 0, "weight_load_calls": 0, "hooks": [],
+            "semantics": "inside clock weight_load (first DefaultModelLoader.load_weights start -> last end): "
+                         "read_s = time in the checkpoint iterator's next() (lazy safetensors mmaps: opens, "
+                         "not bytes); host_convert_s = wall time with a jax_array_from_reshaped_torch call "
+                         "active (checkpoint page faults + torch reshape/permute + t2j on the JAX CPU "
+                         "backend, host only); shard_place_s = same for assign_and_shard_param (host shard "
+                         "selection + H2D enqueue, not blocked). Only the outermost call per key is timed: "
+                         "a wrapper reached through another (a module importing an already-patched name) "
+                         "counts in *_nested_calls, not again in *_s; so does a call from another thread "
+                         "while one is active (wall-clock union). The rest of weight_load is "
+                         "fusion/reorder, cache clears and the loop itself"}
+
+
+@contextlib.contextmanager
+def _checkpoint_clock(stats: Dict[str, Any], clocks: Dict[str, Any]):
+    """Split the normal loader's weight load (``loader.load_weights(model, model_config)`` in
+    tpu_inference models/common/model_loader.py) into checkpoint iteration, host conversion and
+    shard placement.  Patched for this load only; every attribute is restored unconditionally."""
+    import importlib
+    import threading
+
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    lock = threading.Lock()
+    depth: Dict[str, int] = {}
+    since: Dict[str, float] = {}
+
+    def outermost(call, key):
+        name = key[:-len("_s")]
+
+        def timed(*args, **kwargs):
+            with lock:
+                level = depth.get(key, 0)
+                depth[key] = level + 1
+                if level == 0:
+                    since[key] = time.time()
+                    stats[name + "_calls"] += 1
+                else:
+                    stats[name + "_nested_calls"] += 1
+            try:
+                return call(*args, **kwargs)
+            finally:
+                with lock:
+                    depth[key] -= 1
+                    if depth[key] == 0:
+                        stats[key] += time.time() - since.pop(key)
+        return timed
+
+    def timed_iter(loader, *args, **kwargs):
+        iterator = original_iter(loader, *args, **kwargs)
+        while True:
+            started = time.time()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                stats["read_s"] += time.time() - started
+                return
+            stats["read_s"] += time.time() - started
+            stats["tensors"] += 1
+            tensor = item[1]
+            stats["bytes"] += int(tensor.numel() * tensor.element_size()) if hasattr(tensor, "numel") else 0
+            yield item
+
+    def timed_load(loader, *args, **kwargs):
+        started = time.time()
+        try:
+            return original_load(loader, *args, **kwargs)
+        finally:
+            window = clocks.setdefault("weight_load", {"start": started})
+            window["end"] = time.time()
+            stats["weight_load_calls"] += 1
+
+    original_iter = DefaultModelLoader.get_all_weights
+    original_load = DefaultModelLoader.load_weights
+    patched = [(DefaultModelLoader, "get_all_weights", original_iter),
+               (DefaultModelLoader, "load_weights", original_load)]
+    try:
+        DefaultModelLoader.get_all_weights = timed_iter
+        DefaultModelLoader.load_weights = timed_load
+        for module_name, attr, key in _LOADER_HOOKS:
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            original = getattr(module, attr, None)
+            if original is None:
+                continue
+            patched.append((module, attr, original))
+            setattr(module, attr, outermost(original, key))
+            stats["hooks"].append(f"{module_name}.{attr}")
+        yield stats
+    finally:
+        for owner, attr, original in reversed(patched):
+            setattr(owner, attr, original)
 
 
 def _runner_modules() -> Dict[str, Any]:

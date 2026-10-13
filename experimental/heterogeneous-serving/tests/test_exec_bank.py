@@ -41,6 +41,7 @@ LAYER_MAP = tuple((f"layer.{i}", i) for i in range(LAYERS))
 BANKED = ("run_model", "run_compute_logits", "sample", "compute_and_gather_logprobs",
           "compute_and_gather_prompt_logprobs", "select_from_array", "substitute",
           "structured_decode_fn")
+SNAPSHOT_CONTEXT = {"model_path": "/models/fake", "tp_size": 8, "dtype": "float32", "quantization": None}
 
 
 # --------------------------------------------------------------- fake runtime
@@ -361,6 +362,10 @@ def scenario(mode, root):
     kv = FileKV(Path(root) / "kv")
     out = {"mode": mode}
     if mode == "write":
+        # As a first (cold) deploy: the checkpoint-loaded weights are snapshotted right after the load
+        # (weight_snapshot=write), then the bank is captured during precompilation (exec_bank=write).
+        from hetero.weight_snapshot import snapshot
+        snapshot(Path(root) / "snap", runner.state_leaves, SNAPSHOT_CONTEXT, generation="a" * 32)
         bank = eb.WorkerBank("write", str(Path(root) / "bank"), instance_id="large_a", nonce="w",
                              process_rank=0, process_count=1, kv=kv)
         bank.start_capture(runner, modules)
@@ -371,7 +376,17 @@ def scenario(mode, root):
         np.savez(Path(root) / "refs.npz", **_outputs(jax, results))
         out.update(written=report["entries"], skipped=report["skipped"],
                    functions=bank.report()["functions"], counters=dict(bank.counters))
-    elif mode in ("read", "mismatch", "sabotage"):
+    elif mode in ("read", "mismatch", "sabotage", "read_restored"):
+        if mode == "read_restored":
+            # As the later restore deploy: weights come from the snapshot, not the loader that ran
+            # when the bank was written; the bank must still be used with no rejection.
+            from hetero.weight_snapshot import prepare, restore
+            abstract = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in runner.state_leaves]
+            runner.state_leaves = None
+            clocks = {}
+            runner.state_leaves = restore(abstract, runner.mesh, prepare(
+                Path(root) / "snap", SNAPSHOT_CONTEXT, runner.mesh, clocks, verify_checksums=False), clocks)
+            out["restored_from_snapshot"] = "snapshot_device_placement" in clocks
         identity = _identity(jax, model="other") if mode == "mismatch" else _identity(jax)
         bank = eb.WorkerBank("read", str(Path(root) / "bank"), instance_id="large_a", nonce=mode,
                              process_rank=0, process_count=1, kv=kv,
@@ -388,6 +403,11 @@ def scenario(mode, root):
         refs = np.load(Path(root) / "refs.npz")
         got = _outputs(jax, results)
         out["matches_write_process"] = all(np.array_equal(got[k], refs[k]) for k in refs.files)
+        if mode == "read_restored":
+            functions = bank.installation.functions
+            out["hits"] = {k: f.hits for k, f in functions.items()}
+            out["reports"] = {k: {"misses": r["misses"], "rejections": r["rejections"]}
+                              for k, r in bank.report()["functions"].items()}
         if mode == "read":
             functions = bank.installation.functions
             out["hits"] = {k: f.hits for k, f in functions.items()}
@@ -480,6 +500,20 @@ class FreshProcessBankTests(unittest.TestCase):
         self.assertFalse(out["status"]["installed"])
         self.assertIn("sabotaged", out["status"]["fallback_reason"])
         self.assertTrue(out["matches_write_process"])
+
+    def test_bank_from_a_checkpoint_load_serves_snapshot_restored_weights(self):
+        """F0: the bank written by the first (normal-loader) deploy is used, with no rejection, by a
+        later deploy whose weights come from the inline snapshot of that same first deploy."""
+        out = _run("read_restored", self.root)
+        self.assertTrue(out["restored_from_snapshot"])
+        self.assertTrue(out["status"]["installed"], out)
+        self.assertEqual(out["verdict"], "unanimous")
+        self.assertEqual(out["banked_compile_events"], [])
+        self.assertEqual(out["counters"], {"aot_skipped": 10})
+        self.assertTrue(out["matches_write_process"])
+        self.assertTrue(all(v > 0 for v in out["hits"].values()), out["hits"])
+        self.assertEqual({k: r["rejections"] for k, r in out["reports"].items() if r["rejections"]}, {})
+        self.assertEqual({k: r["misses"] for k, r in out["reports"].items() if r["misses"]}, {})
 
 
 class DictKV:
