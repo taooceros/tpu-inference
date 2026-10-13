@@ -142,6 +142,7 @@ class RestoreTailWorkerTests(unittest.TestCase):
                                               rng_key=jax.random.key(0))
         worker._snapshot_location = lambda: self.snapshot_dir
         worker._verify_model_precision = lambda: {}  # Gemma-specific inspection, out of scope here
+        worker._omp_compile_cache_expected = {}  # set by init_device on a real worker
         snapshot(self.snapshot_dir, self.reference, worker._snapshot_context())
         return worker
 
@@ -159,7 +160,7 @@ class RestoreTailWorkerTests(unittest.TestCase):
         self._assert_restored(worker)
         clocks = worker._omp_phase_clocks
         order = ["snapshot_manifest_verify", "snapshot_read_tmpfs", "snapshot_verify", "snapshot_agree",
-                 "loader_entry", "graph_build", "graph_validate", "graph_agree",
+                 "snapshot_generation_vote", "loader_entry", "graph_build", "graph_validate", "graph_agree",
                  "snapshot_device_placement", "graph_update"]
         for key in order:
             self.assertIn(key, clocks)
@@ -171,12 +172,19 @@ class RestoreTailWorkerTests(unittest.TestCase):
     def test_fast_graph_restores_identically_and_restores_tracer_property(self):
         from jax._src import core
         before = core.Tracer.__dict__["sharding"]
-        worker = self._worker(fast_graph=True)
-        worker.load_model()
-        self.assertTrue(worker.omp_snapshot_status["fast_graph"])
-        self.assertTrue(worker.omp_snapshot_status["restored"])
-        self._assert_restored(worker)
-        self.assertIs(core.Tracer.__dict__["sharding"], before)
+        # FastSnapshot's unverified path (weight_snapshot_verify=false) composes with FastGraph.
+        for verify in (True, False):
+            with self.subTest(weight_snapshot_verify=verify):
+                worker = self._worker(fast_graph=True, weight_snapshot_verify=verify)
+                worker.load_model()
+                status = worker.omp_snapshot_status
+                self.assertTrue(status["fast_graph"])
+                self.assertTrue(status["restored"])
+                self.assertEqual(status["checksums_requested"], verify)
+                self.assertFalse(status["verified_checksums"])  # fixture snapshot has checksum_kind none
+                self.assertEqual(status["manifest_version"], 2)
+                self._assert_restored(worker)
+                self.assertIs(core.Tracer.__dict__["sharding"], before)
 
     def test_normal_loader_traces_under_patch_only_when_enabled(self):
         loader = sys.modules["tpu_inference.models.common.model_loader"]

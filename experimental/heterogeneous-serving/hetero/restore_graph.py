@@ -93,6 +93,10 @@ def place_from_manifest(manifest, buffers, mesh):
             if shard['bytes'] != int(np.prod(shard['shape'])) * dtype.itemsize or raw.nbytes != shard['bytes']:
                 raise SnapshotRefused(f"shard byte count mismatch: {row['path']}")
             host = raw.view(dtype).reshape(shard['shape'])
+            # Same ownership rule as weight_snapshot.restore: CPU device_put aliases
+            # the tmpfs map, which Prepared.close() unmaps after restore/fallback.
+            if device.platform == 'cpu':
+                host = np.array(host, copy=True, order='C')
             device_arrays.append(jax.device_put(host, device))
         arrays.append(jax.make_array_from_single_device_arrays(shape, sharding, device_arrays))
     return arrays

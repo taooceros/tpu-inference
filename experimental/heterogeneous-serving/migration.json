@@ -41,8 +41,8 @@
     },
     {
       "path": "hetero/restore_graph.py",
-      "sha256": "844c977db66303024e8e4d32098d5409833b332dfbbd92b8d5805a531b344a63",
-      "bytes": 6135
+      "sha256": "777d9d8f5c5ac5e6a4ce13973c9a07a30cb914028c406265af42059e2379136d",
+      "bytes": 6404
     },
     {
       "path": "hetero/tpu_worker.py",
@@ -91,8 +91,8 @@
     },
     {
       "path": "tests/test_restore_tail_worker.py",
-      "sha256": "f8d24ff86e664be7959eae8242468823fb50f50ff4b9b34d187c77b06af09a6d",
-      "bytes": 11332
+      "sha256": "4fc368f9f68d8decb97342289623758b57af9c672c02463720a2022a3af8e8e0",
+      "bytes": 11976
     },
     {
       "path": "tests/test_weight_snapshot.py",
