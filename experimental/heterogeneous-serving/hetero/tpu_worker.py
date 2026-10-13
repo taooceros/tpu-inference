@@ -234,7 +234,8 @@ class HeteroTPUWorker(TPUWorker):
         mode = self._hetero_payload().get("weight_snapshot", "off")
         self.omp_snapshot_status = {
             "mode": mode, "restored": False,
-            "verified_checksums": self._hetero_payload().get("weight_snapshot_verify", True),
+            "checksums_requested": self._hetero_payload().get("weight_snapshot_verify", True),
+            "verified_checksums": False, "verified_bytes": 0,
         }
         if mode == "read":
             result = self._timed("load_model", self._load_snapshot_or_normal)
@@ -265,12 +266,18 @@ class HeteroTPUWorker(TPUWorker):
             "chip_coords_by_host": payload["chip_coords_by_host"],
         }
 
-    def omp_snapshot_weights(self):
+    def omp_snapshot_weights(self, generation=None):
         from .weight_snapshot import snapshot
+        generation = generation or self._hetero_payload().get("weight_snapshot_generation")
         report = self._timed("snapshot_write", snapshot, self._snapshot_location(),
-                             self.model_runner.state, self._snapshot_context())
+                             self.model_runner.state, self._snapshot_context(), generation=generation)
         return {"executor_rank": self.rank, "process_rank": self.omp_process_rank,
                 "node_ip": self.omp_node_ip, **report}
+
+    def omp_weight_fingerprint(self):
+        from .weight_snapshot import fingerprint
+        return {"executor_rank": self.rank, "process_rank": self.omp_process_rank,
+                "node_ip": self.omp_node_ip, **fingerprint(self.model_runner.state)}
 
     def _load_snapshot_or_normal(self):
         """Restore before closure capture, without an inference-step hook.
@@ -295,7 +302,15 @@ class HeteroTPUWorker(TPUWorker):
         try:
             prepared = prepare(self._snapshot_location(), self._snapshot_context(),
                                runner.mesh, clocks,
-                               verify_checksums=self.omp_snapshot_status["verified_checksums"])
+                               verify_checksums=self.omp_snapshot_status["checksums_requested"])
+            manifest = prepared[0]
+            checksum_kind = manifest.get('checksum_kind', 'sha256')
+            total_bytes = sum(s['bytes'] for a in manifest['arrays'] for s in a['shards'])
+            verified = checksum_kind != 'none' and self.omp_snapshot_status['checksums_requested']
+            self.omp_snapshot_status.update(
+                manifest_version=manifest['version'], checksum_kind=checksum_kind,
+                bytes=total_bytes, verified_checksums=verified,
+                verified_bytes=total_bytes if verified else 0)
         except Exception as exc:
             error = str(exc)
 
@@ -325,9 +340,20 @@ class HeteroTPUWorker(TPUWorker):
 
         try:
             agree(error)
+            vote_start = time.time()
+            manifest = prepared[0]
+            generation = bytes.fromhex(manifest['generation']) if manifest['version'] == 2 else bytes(16)
+            token = np.frombuffer(bytes([manifest['version']]) + generation, dtype=np.uint8)
+            epochs = np.asarray(multihost_utils.process_allgather(token)).reshape(-1, len(token))
+            clocks['snapshot_generation_vote'] = {'start': vote_start, 'end': time.time()}
+            if not np.all(epochs == epochs[0]):
+                raise SnapshotRefused("mixed snapshot generations across workers")
+            self.omp_snapshot_status['generation'] = manifest.get('generation')
             model_loader._get_nnx_model = snapshot_builder
             return super().load_model()
         except SnapshotRefused as exc:
+            if prepared is not None:
+                prepared.close()
             self.omp_snapshot_status.update(restored=False, fallback_reason=str(exc))
             logging.getLogger(__name__).warning("weight snapshot refused; normal loader: %s", exc)
             runner.model_config.dtype = configured_dtype
@@ -335,6 +361,8 @@ class HeteroTPUWorker(TPUWorker):
             return super().load_model()
         finally:
             model_loader._get_nnx_model = original_builder
+            if prepared is not None:
+                prepared.close()
 
     def _verify_model_precision(self) -> Dict[str, Any]:
         """Inspect once after loading, before cache allocation and captured execution."""

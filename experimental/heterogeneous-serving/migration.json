@@ -41,13 +41,13 @@
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "da3b8c88e7c536332ed16c9c4d271bba31632159aee1cc146fb0cb1307139751",
-      "bytes": 38646
+      "sha256": "a7efcf444a02e20f5135cd7426fa25fd9f500cca7a652a99d192ef9e32f659ec",
+      "bytes": 40457
     },
     {
       "path": "hetero/weight_snapshot.py",
-      "sha256": "6e4eed7d4add3a968b785d3daa72391af406c8b07e66a90cd203359069cb0368",
-      "bytes": 9370
+      "sha256": "d3122eef5048b174c124d25724d44434523a625d43396120e6d011c029a6d0d8",
+      "bytes": 21993
     },
     {
       "path": "pkg_util/__init__.py",
@@ -81,8 +81,8 @@
     },
     {
       "path": "tests/test_weight_snapshot.py",
-      "sha256": "079f6de94294241f959cde5cafbc1fd66c845f38b9382be64219d04d2f80ba0f",
-      "bytes": 5838
+      "sha256": "b3d9d116a95701f1d1231dd02fd18ca1a8acb47fa4ea21ad6e2652e7b8c84052",
+      "bytes": 17241
     }
   ]
 }
