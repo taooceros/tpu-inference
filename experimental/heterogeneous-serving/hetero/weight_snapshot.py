@@ -73,6 +73,102 @@ def _sync_directory(directory):
         os.close(fd)
 
 
+def open_for_write(directory):
+    """Exclusive writer lock on ``directory`` and the old manifest invalidated (unlinked + synced).
+
+    Done before any reused shard byte is touched, including on a later failure. Readers hold the
+    same stable lock (shared) through H2D completion. Returns the lock; the caller closes it.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = _lock(directory, exclusive=True)
+    try:
+        (directory / 'manifest.json').unlink(missing_ok=True)
+        _sync_directory(directory)
+    except BaseException:
+        lock.close()
+        raise
+    return lock
+
+
+def publish_manifest(directory, manifest):
+    """Publish ``manifest`` atomically (temp + fsync + rename + directory sync) under the writer lock."""
+    directory = Path(directory)
+    temporary = directory / f"manifest.{manifest['generation']}.tmp"
+    try:
+        with temporary.open('x') as output:
+            json.dump(manifest, output, separators=(',', ':'))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, directory / 'manifest.json')
+        _sync_directory(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class ShardFile:
+    """One reusable shard file: allocate, copy, flush/fsync, record its mtime identity.
+
+    ``allocate`` reserves real pages before mmap (fallocate), so ENOSPC is a catchable error
+    rather than a SIGBUS half-way through the copy. Use as a context manager: the map and the
+    descriptor are closed on every path.
+    """
+
+    def __init__(self, path, nbytes):
+        self.path, self.nbytes = Path(path), nbytes
+        self.fd = self.mapped = None
+        self.reused = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.mapped is not None:
+            self.mapped.close()
+            self.mapped = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def allocate(self):
+        self.reused = self.path.is_file() and self.path.stat().st_size == self.nbytes
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.ftruncate(self.fd, self.nbytes)
+        if self.nbytes:
+            os.posix_fallocate(self.fd, 0, self.nbytes)
+            self.mapped = mmap.mmap(self.fd, self.nbytes, flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
+                                    prot=mmap.PROT_READ | mmap.PROT_WRITE)
+
+    def copy(self, shape, host):
+        """Typed copy into the file (handles strided sources directly in the destination)."""
+        if self.mapped is None:
+            target = np.empty(tuple(shape), dtype=host.dtype)
+        else:
+            target = np.ndarray(tuple(shape), dtype=host.dtype, buffer=self.mapped)
+        np.copyto(target, host, casting='no')
+        del target
+
+    def finish(self):
+        """Flush and fsync; returns the file's mtime_ns (the v2 identity check)."""
+        if self.mapped is not None:
+            self.mapped.flush()
+            self.mapped.close()
+            self.mapped = None
+        os.fsync(self.fd)
+        return os.fstat(self.fd).st_mtime_ns
+
+
+def write_shard(directory, part, host):
+    """Write one shard (``part``: file/shape/bytes) from a host array; sets ``part['mtime_ns']``."""
+    if host.nbytes != part['bytes'] or list(host.shape) != list(part['shape']):
+        raise SnapshotRefused(f"shard {part['file']}: host array does not match its shape/byte count")
+    with ShardFile(Path(directory) / part['file'], part['bytes']) as shard:
+        shard.allocate()
+        shard.copy(part['shape'], host)
+        part['mtime_ns'] = shard.finish()
+        return shard.reused
+
+
 def model_identity(model):
     """Fingerprint configuration contents and checkpoint filesystem identity.
 
@@ -150,6 +246,50 @@ def fingerprint(tree):
             'outside_snapshot_and_restore_timer': True}
 
 
+def file_fingerprint(manifest_path, *, threads=4):
+    """Validation-only SHA-256 of every shard file of one published snapshot (shared lock held).
+
+    Shard rows are the ``scripts/snapshot_validate.py file-fingerprint`` rows (array, shard, path,
+    device_id, index, shape, dtype, bytes, sha256). ``array_meta`` adds the per-array layout
+    (path, shape, dtype, spec, mesh shape/axes, devices) for exactness comparisons.
+    """
+    manifest_path = Path(manifest_path)
+    directory = manifest_path.parent
+    with (directory / '.snapshot.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        manifest = json.loads(manifest_path.read_text())
+        jobs = [(number, shard_number, array, shard)
+                for number, array in enumerate(manifest['arrays'])
+                for shard_number, shard in enumerate(array['shards'])]
+
+        def hash_file(job):
+            number, shard_number, array, shard = job
+            file = directory / shard['file']
+            if file.parent != directory or file.stat().st_size != shard['bytes']:
+                raise RuntimeError(f'missing/wrong-sized shard: {file}')
+            raw = np.memmap(file, mode='r', dtype=np.uint8) if shard['bytes'] else np.empty(0, np.uint8)
+            try:
+                digest = hashlib.sha256(raw).hexdigest()
+            finally:
+                if isinstance(raw, np.memmap):
+                    raw._mmap.close()
+            return {'array': number, 'shard': shard_number, 'path': array['path'],
+                    'device_id': shard['device_id'], 'index': shard['index'],
+                    'shape': shard['shape'], 'dtype': array['dtype'],
+                    'bytes': shard['bytes'], 'sha256': digest}
+
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            shards = list(pool.map(hash_file, jobs))
+    shards.sort(key=lambda s: (s['array'], s['shard']))
+    return {'layout': directory.parent.parent.name, 'instance': directory.parent.name,
+            'process_rank': int(directory.name.removeprefix('rank')),
+            'bytes': sum(s['bytes'] for s in shards), 'shards': shards,
+            'sha256': hashlib.sha256(json.dumps(shards, sort_keys=True).encode()).hexdigest(),
+            'generation': manifest.get('generation'),
+            'array_meta': [{k: a[k] for k in ('path', 'shape', 'dtype', 'spec', 'mesh_shape',
+                                              'mesh_axes', 'devices')} for a in manifest['arrays']]}
+
+
 def snapshot(directory, tree, context, *, checksum='none', generation=None):
     """Copy all local shards to reusable, shared files; publish only on completion.
 
@@ -165,14 +305,10 @@ def snapshot(directory, tree, context, *, checksum='none', generation=None):
     generation = uuid.uuid4().hex if generation is None else uuid.UUID(hex=generation).hex
     begin = time.perf_counter()
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    lock = _lock(directory, exclusive=True)
-    temporary = directory / f'manifest.{generation}.tmp'
+    # Invalidate before touching any reused bytes, including on validation
+    # failure. Readers hold this same stable lock through H2D completion.
+    lock = open_for_write(directory)
     try:
-        # Invalidate before touching any reused bytes, including on validation
-        # failure. Readers hold this same stable lock through H2D completion.
-        (directory / 'manifest.json').unlink(missing_ok=True)
-        _sync_directory(directory)
         manifest = {'version': 2, 'context': context, 'generation': generation,
                     'checksum_kind': checksum, 'arrays': []}
         groups = {}
@@ -210,20 +346,9 @@ def snapshot(directory, tree, context, *, checksum='none', generation=None):
                      'copy_s': 0., 'checksum_s': 0., 'flush_s': 0.,
                      'transfer_end_s': submit_end - submit_start}
             for data, part in items:
-                path = directory / part['file']
                 tick = time.perf_counter()
-                reused = path.is_file() and path.stat().st_size == part['bytes']
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-                mapped = None
-                try:
-                    os.ftruncate(fd, part['bytes'])
-                    if part['bytes']:
-                        # Reserve real pages before mmap: ENOSPC is a catchable
-                        # error, rather than a SIGBUS half-way through np.copyto.
-                        os.posix_fallocate(fd, 0, part['bytes'])
-                        mapped = mmap.mmap(fd, part['bytes'],
-                                           flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
-                                           prot=mmap.PROT_READ | mmap.PROT_WRITE)
+                with ShardFile(directory / part['file'], part['bytes']) as shard:
+                    shard.allocate()
                     stats['allocation_s'] += time.perf_counter() - tick
                     tick = time.perf_counter()
                     # The exposed native collector avoids filling _npy_value
@@ -237,12 +362,7 @@ def snapshot(directory, tree, context, *, checksum='none', generation=None):
                     stats['did_copy_arrays'] += int(did_copy)
                     stats['strided_arrays'] += int(not host.flags.c_contiguous)
                     tick = time.perf_counter()
-                    if mapped is None:
-                        target = np.empty(tuple(part['shape']), dtype=host.dtype)
-                    else:
-                        target = np.ndarray(tuple(part['shape']), dtype=host.dtype, buffer=mapped)
-                    np.copyto(target, host, casting='no')
-                    del target
+                    shard.copy(part['shape'], host)
                     stats['copy_s'] += time.perf_counter() - tick
                     tick = time.perf_counter()
                     if checksum == 'sha256':
@@ -254,31 +374,17 @@ def snapshot(directory, tree, context, *, checksum='none', generation=None):
                     del host
                     stats['checksum_s'] += time.perf_counter() - tick if checksum != 'none' else 0.
                     tick = time.perf_counter()
-                    if mapped is not None:
-                        mapped.flush()
-                        mapped.close()
-                        mapped = None
-                    os.fsync(fd)
-                    part['mtime_ns'] = os.fstat(fd).st_mtime_ns
+                    part['mtime_ns'] = shard.finish()
                     stats['flush_s'] += time.perf_counter() - tick
                     stats['bytes'] += part['bytes']
                     stats['files'] += 1
-                    stats['reused_files' if reused else 'new_files'] += 1
-                finally:
-                    if mapped is not None:
-                        mapped.close()
-                    os.close(fd)
+                    stats['reused_files' if shard.reused else 'new_files'] += 1
             return stats
 
         with ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
             chip_times = list(pool.map(copy_chip, groups.values()))
         publish_start = time.perf_counter()
-        with temporary.open('x') as output:
-            json.dump(manifest, output, separators=(',', ':'))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, directory / 'manifest.json')
-        _sync_directory(directory)
+        publish_manifest(directory, manifest)
         published = time.perf_counter()
         active = lambda name: max((c[name] for c in chip_times), default=0.)
         return {'directory': str(directory), 'bytes': sum(c['bytes'] for c in chip_times),
@@ -296,7 +402,6 @@ def snapshot(directory, tree, context, *, checksum='none', generation=None):
                             'publish_s': published - publish_start},
                 'phase_semantics': 'snapshot_s includes publication; transfer_s is submit to last host acquisition (overlaps and includes preceding allocation/copies); wait/allocation/copy/checksum/flush are max per-chip active sums, not additive wall phases'}
     finally:
-        temporary.unlink(missing_ok=True)
         lock.close()
 
 

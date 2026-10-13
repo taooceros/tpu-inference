@@ -304,8 +304,19 @@ class HeteroTPUWorker(TPUWorker):
             # immediately before the first device touch (TPUWorker.init_device -> jax.devices()).
             from .prespawn import park_and_wait
 
-            self._omp_prespawn_gate = self._timed("prespawn_gate", park_and_wait, gate, local_ip)
-        result = self._timed("init_device", super().init_device, *args, **kwargs)
+            if payload.get("preread"):
+                # Before parking: the CPU-only child writes this rank's snapshot while we wait.
+                self._omp_start_preread(payload)
+            try:
+                self._omp_prespawn_gate = self._timed("prespawn_gate", park_and_wait, gate, local_ip)
+            except BaseException:
+                self._omp_kill_preread("release gate aborted")
+                raise
+        try:
+            result = self._timed("init_device", super().init_device, *args, **kwargs)
+        except BaseException:
+            self._omp_kill_preread("init_device failed")
+            raise
         if gate:
             self._omp_prespawn_gate["devices_ready_at"] = time.time()
         verify_compile_cache(self._omp_compile_cache_expected)
@@ -385,6 +396,72 @@ class HeteroTPUWorker(TPUWorker):
         return {"executor_rank": self.rank, "process_rank": self.omp_process_rank,
                 "node_ip": self.omp_node_ip, **fingerprint(self.model_runner.state)}
 
+    # ------------------------------------------------- parked-target pre-read (hetero/preread.py)
+
+    def _omp_start_preread(self, payload):
+        """Start the CPU-only pre-read child before parking; never touches a JAX backend.
+
+        Files live under <weight_snapshot_root>/.preread/<layout>/<instance>/rank<k>/ (spec,
+        pickled vllm_config, report, log); the child writes the snapshot where the read path
+        looks (_snapshot_location). A start failure is recorded and refuses the read path later.
+        """
+        from pathlib import Path
+        from .preread import device_table, start_child, write_spec
+
+        record = self.__dict__["_omp_preread"] = {"requested_at": time.time()}
+        try:
+            directory = (Path(payload["weight_snapshot_root"]) / ".preread" / payload["layout_id"]
+                         / payload["instance_id"] / f"rank{self.omp_process_rank}")
+            table = device_table(payload)
+            spec = write_spec(directory, vllm_config=self.vllm_config, rank=self.omp_process_rank,
+                              table=table, out_dir=str(self._snapshot_location()),
+                              generation=payload["weight_snapshot_generation"],
+                              context=self._snapshot_context())
+            self._omp_preread_child = start_child(spec, tp=int(payload["tp_size"]))
+            record.update(started_at=self._omp_preread_child.started_at, pid=self._omp_preread_child.process.pid,
+                          spec=str(spec), log=str(self._omp_preread_child.log_path),
+                          table_device_ids=[d["id"] for d in table["devices"]])
+        except Exception as exc:
+            record["error"] = f"pre-read start failed: {type(exc).__name__}: {exc}"
+
+    def _omp_wait_preread(self):
+        """Bounded wait for the child; returns None (snapshot usable) or the refusal reason."""
+        from .preread import gate_outcome
+
+        record = self.__dict__["_omp_preread"]
+        child = self.__dict__.get("_omp_preread_child")
+        if child is None:
+            error = record.get("error") or "pre-read child was not started"
+        else:
+            record["wait_started_at"] = time.time()
+            outcome = child.wait(float(self._hetero_payload().get("preread_timeout_s", 900.0)))
+            record["wait_ended_at"] = time.time()
+            report = outcome.pop("report", None)
+            record.update(outcome)
+            record["report"] = report
+            error = gate_outcome({**outcome, "report": report})
+            record["error"] = error
+            if error is not None:
+                # The log lives in the run scope, which a failed attempt's cleanup removes: ship its tail.
+                try:
+                    with open(child.log_path, "rb") as log:
+                        log.seek(0, 2)
+                        log.seek(max(0, log.tell() - 8192))
+                        record["log_tail"] = log.read().decode("utf-8", "replace")
+                except OSError as exc:
+                    record["log_tail"] = f"unreadable: {exc}"
+        record["used"] = error is None
+        self.omp_snapshot_status["preread"] = record
+        return error
+
+    def _omp_kill_preread(self, reason):
+        """Kill and reap the child on an abort path (idempotent)."""
+        child = self.__dict__.get("_omp_preread_child")
+        if child is not None and child.process.poll() is None:
+            child.kill()
+            self.__dict__["_omp_preread"].update(killed_reason=reason, ended_at=child.ended_at,
+                                                 exit_code=child.process.returncode)
+
     def _load_snapshot_or_normal(self):
         """Restore before closure capture, without an inference-step hook.
 
@@ -405,7 +482,14 @@ class HeteroTPUWorker(TPUWorker):
         configured_dtype = runner.model_config.dtype
         error = None
         prepared = None
+        if "_omp_preread" in self.__dict__:
+            # Parked-target pre-read: this rank's snapshot comes from the CPU-only child. Wait for
+            # it (bounded); a failed, killed or timed-out child refuses locally, so the all-rank
+            # vote below falls back to the normal loader.
+            error = self._timed("preread_wait", self._omp_wait_preread)
         try:
+            if error is not None:
+                raise SnapshotRefused(f"pre-read: {error}")
             prepared = prepare(self._snapshot_location(), self._snapshot_context(),
                                runner.mesh, clocks,
                                verify_checksums=self.omp_snapshot_status["checksums_requested"])
@@ -655,6 +739,7 @@ class HeteroTPUWorker(TPUWorker):
                 **({"normal_load": self._omp_normal_load} if "_omp_normal_load" in self.__dict__ else {}),
                 **({"prespawn_gate": self._omp_prespawn_gate} if "_omp_prespawn_gate" in self.__dict__
                    else {}),
+                **({"preread": self._omp_preread} if "_omp_preread" in self.__dict__ else {}),
                 "exec_bank": (self._omp_exec_bank.report() if "_omp_exec_bank" in self.__dict__
                               else {"mode": None}),
                 "startup_profiles": self.__dict__.get("_omp_startup_profiles", {}),
