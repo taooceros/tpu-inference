@@ -1,0 +1,101 @@
+diff --git a/src/dmtcp_launch.cpp b/src/dmtcp_launch.cpp
+index a955423..58b8f8f 100644
+--- a/src/dmtcp_launch.cpp
++++ b/src/dmtcp_launch.cpp
+@@ -125,6 +125,8 @@ static const char *theUsage =
+   "              Disable alloc plugin (default: enabled).\n"
+   "  --disable-dl-plugin: (environment variable DMTCP_DL_PLUGIN=[01])\n"
+   "              Disable dl plugin (default: enabled).\n"
++  "  --disable-pid-plugin\n"
++  "              Use kernel PIDs (application-cached PIDs must be rebound).\n"
+   "  --disable-all-plugins (EXPERTS ONLY, FOR DEBUGGING)\n"
+   "              Disable all plugins.\n"
+   "\n"
+@@ -306,6 +308,9 @@ processArgs(int *orig_argc, const char ***orig_argv)
+     } else if (s == "--disable-dl-plugin") {
+       setenv(ENV_VAR_DL_PLUGIN, "0", 1);
+       shift;
++    } else if (s == "--disable-pid-plugin") {
++      enablePIDPlugin = false;
++      shift;
+     } else if (s == "--no-plugins" || s == "--disable-all-plugins") {
+       disableAllPlugins = true;
+       shift;
+diff --git a/src/threadlist.cpp b/src/threadlist.cpp
+index d53da48..91cf05e 100644
+--- a/src/threadlist.cpp
++++ b/src/threadlist.cpp
+@@ -756,6 +756,11 @@ ThreadList::postRestart(double readTime, int restartPause)
+ {
+   // This function and related ones are defined in src/mtcp/restore_libc.c
+   TLSInfo_RestoreTLSState(motherofall);
++  if (!dmtcp_update_virtual_to_real_tid) {
++    // Without the PID plugin no mapping can repair the saved kernel identities.
++    motherofall->tid = _real_syscall(SYS_gettid);
++    motherpid = _real_syscall(SYS_getpid);
++  }
+   TLSInfo_RestoreTLSTidPid(motherofall);
+ 
+   restartPauseLevel = restartPause;
+@@ -777,7 +782,9 @@ ThreadList::postRestartWork(double readTime)
+     TLSInfo_SetThreadSysinfo(saved_sysinfo);
+   }
+ 
+-  dmtcp_update_virtual_to_real_tid(motherofall->tid);
++  if (dmtcp_update_virtual_to_real_tid) {
++    dmtcp_update_virtual_to_real_tid(motherofall->tid);
++  }
+ 
+   DMTCP_RESTART_PAUSE_WHILE(restartPauseLevel == 3);
+ 
+@@ -825,13 +832,18 @@ restarthread(void *threadv)
+   Thread *thread = (Thread *)threadv;
+ 
+   TLSInfo_RestoreTLSState(thread);
++  if (!dmtcp_update_virtual_to_real_tid) {
++    thread->tid = _real_syscall(SYS_gettid);
++  }
+   TLSInfo_RestoreTLSTidPid(thread);
+ 
+   if (TLSInfo_HaveThreadSysinfoOffset()) {
+     TLSInfo_SetThreadSysinfo(saved_sysinfo);
+   }
+ 
+-  dmtcp_update_virtual_to_real_tid(thread->tid);
++  if (dmtcp_update_virtual_to_real_tid) {
++    dmtcp_update_virtual_to_real_tid(thread->tid);
++  }
+ 
+   if (thread == motherofall) {  // if this is a user thread
+     DMTCP_RESTART_PAUSE_WHILE(restartPauseLevel == 4);
+diff --git a/src/threadwrappers.cpp b/src/threadwrappers.cpp
+index bd18ff2..d188bcb 100644
+--- a/src/threadwrappers.cpp
++++ b/src/threadwrappers.cpp
+@@ -47,7 +47,9 @@ gettid(void) __THROW
+ static void
+ processChildThread(Thread *thread)
+ {
+-  dmtcp_init_virtual_tid();
++  if (dmtcp_init_virtual_tid) {
++    dmtcp_init_virtual_tid();
++  }
+   JASSERT(thread->wrapperLockCount != 0);
+ 
+   ThreadList::initThread(thread);
+diff --git a/src/dmtcpworker.cpp b/src/dmtcpworker.cpp
+--- a/src/dmtcpworker.cpp
++++ b/src/dmtcpworker.cpp
+@@ -233,6 +233,12 @@ dmtcp_initialize_entry_point()
+   WorkerState::setCurrentState(WorkerState::RUNNING);
+ 
+   PluginManager::initialize();
++
++  // Core state must not depend on PID-plugin lazy access. An exec preserves
++  // PROTECTED_SHM_FD, but not this library's sharedDataHeader mapping.
++  if (!SharedData::initialized()) {
++    SharedData::initialize();
++  }
+ 
+   prepareLogAndProcessdDataFromSerialFile();
+ 
