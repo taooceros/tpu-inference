@@ -41,7 +41,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 MANIFEST = "manifest.json"
-FORMAT = 1
+RELOCATION = "relocation.json"
+# 2: the identity no longer names hosts (``placement`` is recorded beside it, never compared);
+# it gains the runtime's topology fingerprint and each rank's chip coordinates instead.
+FORMAT = 2
 DEFAULT_DIR = "/root/.cache/omp_exec_bank"
 VOTE_NAMESPACE = "omp_exec_bank"
 VOTE_TIMEOUT_S = 120.0
@@ -123,10 +126,30 @@ def runtime_identity(env=os.environ) -> Dict[str, Any]:
     }
 
 
+def topology_fingerprint(devices) -> Dict[str, Any]:
+    """XLA's fingerprint of the topology ``devices`` form, the same value JAX's persistent
+    compilation cache keys on (``jax/_src/cache_key.py`` ``_hash_accelerator_config``)."""
+    try:
+        from jax._src.lib import xla_client
+        return {"value": int(xla_client.get_topology_for_devices(list(devices)).fingerprint())}
+    except Exception as exc:  # noqa: BLE001 - backends without a topology description (CPU)
+        return {"value": None, "unavailable": type(exc).__name__}
+
+
 def engine_identity(runner, payload: Dict[str, Any], *, backend_revision: str,
                     runtime_revision: str, runtime: Dict[str, Any],
                     files: Dict[str, Optional[str]], num_blocks: int) -> Dict[str, Dict[str, Any]]:
-    """{"instance": shared by every rank (digest names the bank), "rank": this process}."""
+    """{"instance": shared by every rank (digest names the bank), "rank": this process,
+    "placement": where it runs (recorded in the manifest, never compared)}.
+
+    Each instance runs its own sub-slice runtime (``hetero/layout.py`` sets TPU_TOPOLOGY,
+    host bounds and the rank-ordered TPU_PROCESS_ADDRESSES per instance), so device ids and
+    chip coordinates are relative to the sub-slice and process ranks follow the host grid
+    (row-major, ``resolve_layout``). Two congruent placements therefore present the same
+    topology, device assignment and per-rank devices; only the host addresses differ, and those
+    reach the distributed runtime, not the compiler. The identity keeps everything the compiled
+    program depends on and leaves the hosts out, so a bank written on one placement is valid on
+    every congruent one."""
     import jax
 
     config = runner.vllm_config
@@ -173,7 +196,7 @@ def engine_identity(runner, payload: Dict[str, Any], *, backend_revision: str,
             "mesh_shape": [int(v) for v in mesh.devices.shape],
             "mesh_device_ids": [int(d.id) for d in mesh.devices.flat],
             "process_count": int(jax.process_count()),
-            "host_order": [a.rsplit(":", 1)[0] for a in env["TPU_PROCESS_ADDRESSES"].split(",")],
+            "topology_fingerprint": topology_fingerprint(mesh.devices.flat),
             "TPU_TOPOLOGY": env.get("TPU_TOPOLOGY"),
             "TPU_HOST_BOUNDS": env.get("TPU_HOST_BOUNDS"),
             "TPU_CHIPS_PER_HOST_BOUNDS": env.get("TPU_CHIPS_PER_HOST_BOUNDS"),
@@ -182,11 +205,22 @@ def engine_identity(runner, payload: Dict[str, Any], *, backend_revision: str,
         "code": {"backend_revision": backend_revision, "runtime_revision": runtime_revision,
                  "runner_files": files},
     }
+    local = sorted(jax.local_devices(), key=lambda d: d.id)
     rank = {
         "process_index": int(jax.process_index()),
-        "local_device_ids": sorted(int(d.id) for d in jax.local_devices()),
+        "local_device_ids": [int(d.id) for d in local],
+        "local_device_coords": [list(getattr(d, "coords", None) or []) for d in local],
     }
-    return {"instance": instance, "rank": rank}
+    placement = {
+        "host_order": [a.rsplit(":", 1)[0] for a in env["TPU_PROCESS_ADDRESSES"].split(",")],
+    }
+    return {"instance": instance, "rank": rank, "placement": placement}
+
+
+def split_placement(identity: Dict[str, Any]):
+    """(identity without placement, placement or None): only the first is compared or digested."""
+    identity = dict(identity)
+    return identity, identity.pop("placement", None)
 
 
 # ----------------------------------------------------------- bucket keys
@@ -377,10 +411,12 @@ class BankedFunction:
 def serialize_entry(compiled) -> bytes:
     """Pickled (payload, in_tree, out_tree, device ids); ExecBankError when not serializable.
 
-    The device ids are the executable's device assignment in order (the runner mesh order,
-    e.g. [0, 1, 4, 5, ...] on a TP16 sub-slice).  ``deserialize_and_load`` otherwise loads the
-    XLA executable onto ``backend.devices()`` in id order (jax serialize_executable.py:63-64,
-    116-119) while the unpickled shardings keep the mesh order, and the first call aborts in
+    The device ids are the executable's device assignment in order (the runner mesh order:
+    on a 4x4 TP16 sub-slice ``mesh_utils.create_device_mesh`` gives the ring
+    [0, 1, 2, 3, 7, 6, 5, 9, 10, 11, 15, 14, 13, 12, 8, 4], jax ``_TRAY_4x4_RING_ORDER``).
+    ``deserialize_and_load`` otherwise loads the XLA executable onto ``backend.devices()`` in id
+    order (jax serialize_executable.py:66-67, 109-110) while the unpickled shardings keep the
+    mesh order, and the first call aborts in
     PjRt ("PjRtBuffer's memory space is addressed by device TPU_5 vs sharding is on device
     TPU_4"; O2 attempt 1).
     """
@@ -431,8 +467,11 @@ def bank_path(root: str, identity: Dict[str, Any]) -> Path:
 
 def write_bank(root: str, identity: Dict[str, Any], functions: Iterable[BankedFunction],
                *, nonce: Optional[str] = None) -> Dict[str, Any]:
-    """Serialize every captured entry; atomic replace of this rank's directory."""
+    """Serialize every captured entry; atomic replace of this rank's directory.
+
+    ``identity["placement"]`` (the writer's hosts) goes into the manifest beside the identity."""
     started = time.time()
+    identity, placement = split_placement(identity)
     target = bank_path(root, identity)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = target.parent / f".tmp-{target.name}-{uuid.uuid4().hex}"
@@ -453,6 +492,7 @@ def write_bank(root: str, identity: Dict[str, Any], functions: Iterable[BankedFu
                 total += len(data)
         manifest = {"format": FORMAT, "identity": identity,
                     "identity_digest": digest(identity["instance"]), "nonce": nonce,
+                    "placement": placement,
                     "entries": entries, "skipped": skipped,
                     "entry_set_digest": entry_set_digest(e["key"] for e in entries.values()),
                     "written_at": time.time()}
@@ -499,8 +539,12 @@ def _nearest_bank(root: str, identity: Dict[str, Any]) -> str:
 
 
 def load_bank(root: str, identity: Dict[str, Any]) -> Dict[str, Any]:
-    """Verify identity and checksums, deserialize every entry. Raises ExecBankError."""
+    """Verify identity and checksums, deserialize every entry. Raises ExecBankError.
+
+    The writer's placement is reported, never compared: a bank written on one placement loads
+    on every congruent one (see ``engine_identity``)."""
     started = time.time()
+    identity, _ = split_placement(identity)
     path = bank_path(root, identity)
     manifest_file = path / MANIFEST
     if not manifest_file.exists():
@@ -522,9 +566,101 @@ def load_bank(root: str, identity: Dict[str, Any]) -> Dict[str, Any]:
             raise ExecBankError(f"deserialize failed for {name}: {type(exc).__name__}: {exc}") from exc
         tables.setdefault(entry["fn"], {})[entry["key"]] = compiled
     keys = [e["key"] for e in manifest["entries"].values()]
+    relocation = path / RELOCATION
     return {"path": str(path), "tables": tables, "entries": len(keys),
             "entry_set_digest": entry_set_digest(keys), "load_s": time.time() - started,
-            "written_nonce": manifest.get("nonce")}
+            "written_nonce": manifest.get("nonce"), "written_placement": manifest.get("placement"),
+            "relocation": json.loads(relocation.read_text()) if relocation.exists() else None}
+
+
+# -------------------------------------------------------------- relocation
+
+def bank_inventory(root: str) -> list:
+    """Every rank bank under ``root`` on this host: identity digest, rank, writer placement,
+    relocation record and each entry's sha256 (read-only; manifests only, any format)."""
+    rows = []
+    for path in sorted(Path(root).glob(f"*/rank*/{MANIFEST}")):
+        try:
+            raw = path.read_bytes()
+            manifest = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            rows.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        identity = manifest.get("identity") or {}
+        relocation = path.parent / RELOCATION
+        rows.append({
+            "path": str(path.parent), "format": manifest.get("format"),
+            "identity_digest": manifest.get("identity_digest"),
+            "rank": (identity.get("rank") or {}).get("process_index"),
+            "placement": manifest.get("placement")
+            or {"host_order": ((identity.get("instance") or {}).get("parallel") or {}).get("host_order")},
+            "relocation": json.loads(relocation.read_text()) if relocation.exists() else None,
+            "manifest_sha256": _sha256(raw), "written_at": manifest.get("written_at"),
+            "entry_set_digest": manifest.get("entry_set_digest"),
+            "entries": {e["key"]: e["sha256"] for e in (manifest.get("entries") or {}).values()},
+            "bytes": sum(e["bytes"] for e in (manifest.get("entries") or {}).values()),
+        })
+    return rows
+
+
+def read_rank_bank(root: str, identity_digest: str, rank: int) -> Dict[str, Any]:
+    """One rank's bank as bytes (manifest verbatim + every entry, sha256-checked)."""
+    path = Path(root) / identity_digest / f"rank{int(rank)}"
+    raw = (path / MANIFEST).read_bytes()
+    manifest = json.loads(raw)
+    if manifest.get("identity_digest") != identity_digest:
+        raise ExecBankError(f"{path}: manifest digest {manifest.get('identity_digest')} != directory")
+    if manifest["identity"]["rank"]["process_index"] != int(rank):
+        raise ExecBankError(f"{path}: manifest is rank {manifest['identity']['rank']['process_index']}")
+    files = {}
+    for name, entry in sorted(manifest["entries"].items()):
+        data = (path / name).read_bytes()
+        if _sha256(data) != entry["sha256"]:
+            raise ExecBankError(f"checksum mismatch for {path / name}")
+        files[name] = data
+    return {"identity_digest": identity_digest, "rank": int(rank), "manifest": raw,
+            "manifest_sha256": _sha256(raw), "files": files}
+
+
+def install_rank_bank(root: str, bundle: Dict[str, Any], provenance: Dict[str, Any], *,
+                      replace: bool = False) -> Dict[str, Any]:
+    """Write a ``read_rank_bank`` bundle under ``root`` byte for byte (atomic rename).
+
+    The manifest is not rewritten; ``relocation.json`` beside it records where the bytes came
+    from. An existing directory is refused unless ``replace``, so a relocated bank can never be
+    mistaken for one this host wrote itself."""
+    started = time.time()
+    manifest = json.loads(bundle["manifest"])
+    target = Path(root) / bundle["identity_digest"] / f"rank{bundle['rank']}"
+    if target.exists() and not replace:
+        raise ExecBankError(f"{target} exists; refusing to overwrite a bank in place")
+    if set(bundle["files"]) != set(manifest["entries"]):
+        raise ExecBankError("bundle files differ from its manifest entries")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.parent / f".tmp-{target.name}-{uuid.uuid4().hex}"
+    staging.mkdir()
+    try:
+        for name, data in bundle["files"].items():
+            if _sha256(data) != manifest["entries"][name]["sha256"]:
+                raise ExecBankError(f"checksum mismatch for {name} before install")
+            (staging / name).write_bytes(data)
+        (staging / MANIFEST).write_bytes(bundle["manifest"])
+        (staging / RELOCATION).write_text(json.dumps(
+            {**provenance, "manifest_sha256": bundle["manifest_sha256"], "installed_at": time.time()},
+            sort_keys=True, indent=1))
+        old = None
+        if target.exists():
+            old = target.parent / f".old-{target.name}-{uuid.uuid4().hex}"
+            os.rename(target, old)
+        os.rename(staging, target)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {"path": str(target), "entries": len(bundle["files"]),
+            "bytes": sum(len(d) for d in bundle["files"].values()),
+            "manifest_sha256": bundle["manifest_sha256"], "install_s": time.time() - started}
 
 
 # ------------------------------------------------------------- unanimity
@@ -847,7 +983,8 @@ class WorkerBank:
                 installation.functions[fn_id].load(table)
             vote["entry_set_digest"] = loaded["entry_set_digest"]
             self.status["loaded"] = {k: loaded[k] for k in
-                                     ("path", "entries", "entry_set_digest", "load_s", "written_nonce")}
+                                     ("path", "entries", "entry_set_digest", "load_s", "written_nonce",
+                                      "written_placement", "relocation")}
         except Exception as exc:  # noqa: BLE001 - refuse in the vote rather than diverge
             self.deactivate()
             message = str(exc) if isinstance(exc, ExecBankError) else f"{type(exc).__name__}: {exc}"

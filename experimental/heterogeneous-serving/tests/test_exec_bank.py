@@ -70,8 +70,9 @@ def _jax_setup():
                                      meta_fields=["padded_num_reqs"])
     jax.tree_util.register_dataclass(SamplingMD, data_fields=["temperature"],
                                      meta_fields=["do_sampling"])
-    # Device order not in id order, as on a TPU sub-slice (H mesh ids [0, 1, 4, 5, 2, 3, ...]):
-    # a bank that loads executables in backend.devices() order aborts here (O2 attempt 1).
+    # Device order not in id order, as on a TPU sub-slice (H's TP16 mesh is the 4x4 ring
+    # [0, 1, 2, 3, 7, 6, 5, 9, ...]; rank 0 holds ids 0, 1, 5, 4 in that order): a bank that
+    # loads executables in backend.devices() order aborts here (O2 attempt 1).
     import numpy as np
     from jax.sharding import Mesh
     by_id = {d.id: d for d in jax.devices()}
@@ -326,10 +327,11 @@ class FileKV:
         return path.read_bytes() if path.exists() else None
 
 
-def _identity(jax, **override):
+def _identity(jax, placement=("10.0.0.1",), **override):
     instance = {"model": "fake", "layers": LAYERS, "jax": jax.__version__,
                 "platform_version": jax.devices()[0].client.platform_version, **override}
-    return {"instance": instance, "rank": {"process_index": 0}}
+    return {"instance": instance, "rank": {"process_index": 0},
+            "placement": {"host_order": list(placement)}}
 
 
 def _compile_events(jax):
@@ -376,7 +378,7 @@ def scenario(mode, root):
         np.savez(Path(root) / "refs.npz", **_outputs(jax, results))
         out.update(written=report["entries"], skipped=report["skipped"],
                    functions=bank.report()["functions"], counters=dict(bank.counters))
-    elif mode in ("read", "mismatch", "sabotage", "read_restored"):
+    elif mode in ("read", "mismatch", "sabotage", "read_restored", "relocated"):
         if mode == "read_restored":
             # As the later restore deploy: weights come from the snapshot, not the loader that ran
             # when the bank was written; the bank must still be used with no rejection.
@@ -388,7 +390,12 @@ def scenario(mode, root):
                 Path(root) / "snap", SNAPSHOT_CONTEXT, runner.mesh, clocks, verify_checksums=False), clocks)
             out["restored_from_snapshot"] = "snapshot_device_placement" in clocks
         identity = _identity(jax, model="other") if mode == "mismatch" else _identity(jax)
-        bank = eb.WorkerBank("read", str(Path(root) / "bank"), instance_id="large_a", nonce=mode,
+        bank_dir = "bank"
+        if mode == "relocated":
+            # Another host of a congruent placement: the bank bytes were copied there (no write on
+            # this "host"), and this process runs with different host addresses.
+            identity, bank_dir = _identity(jax, placement=("10.9.9.9",)), "bank_b"
+        bank = eb.WorkerBank("read", str(Path(root) / bank_dir), instance_id="large_a", nonce=mode,
                              process_rank=0, process_count=1, kv=kv,
                              sabotage_rank=0 if mode == "sabotage" else None)
         bank.load(runner, modules, lambda: identity)
@@ -408,6 +415,9 @@ def scenario(mode, root):
             out["hits"] = {k: f.hits for k, f in functions.items()}
             out["reports"] = {k: {"misses": r["misses"], "rejections": r["rejections"]}
                               for k, r in bank.report()["functions"].items()}
+        if mode == "relocated":
+            out["loaded"] = {k: bank.status["loaded"][k] for k in ("written_placement", "relocation")}
+            out["hits"] = {k: f.hits for k, f in bank.installation.functions.items()}
         if mode == "read":
             functions = bank.installation.functions
             out["hits"] = {k: f.hits for k, f in functions.items()}
@@ -466,6 +476,42 @@ class FreshProcessBankTests(unittest.TestCase):
         self.assertEqual(functions["sample"]["captured"], 2)
         self.assertEqual(functions["structured_decode"]["captured"], 1)
         self.assertEqual(self.write["counters"]["aot_captured"], 10)  # all but run_model (not a jit)
+
+    def test_relocated_bank_loads_on_other_hosts(self):
+        # The bank written above is copied byte for byte to another root (another host of a
+        # congruent placement) and read by a process whose host addresses differ.
+        digest_dir = next((self.root / "bank").iterdir()).name
+        bundle = eb.read_rank_bank(str(self.root / "bank"), digest_dir, 0)
+        installed = eb.install_rank_bank(str(self.root / "bank_b"), bundle, {"source_host": "10.0.0.1"})
+        self.assertEqual(installed["entries"], 12)
+        with self.assertRaises(eb.ExecBankError):  # never overwrite a bank in place
+            eb.install_rank_bank(str(self.root / "bank_b"), bundle, {})
+        out = _run("relocated", self.root)
+        self.assertEqual(out["verdict"], "unanimous")
+        self.assertTrue(out["status"]["installed"])
+        self.assertEqual(out["banked_compile_events"], [])
+        self.assertTrue(out["matches_write_process"])
+        self.assertEqual(out["loaded"]["written_placement"], {"host_order": ["10.0.0.1"]})
+        self.assertEqual(out["loaded"]["relocation"]["source_host"], "10.0.0.1")
+        self.assertTrue(all(out["hits"].values()), out["hits"])
+
+    def test_relocation_refuses_corrupt_bytes(self):
+        import shutil
+        import tempfile
+        digest_dir = next((self.root / "bank").iterdir()).name
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(self.root / "bank", Path(tmp) / "bank")
+            entry = next(p for p in (Path(tmp) / "bank" / digest_dir / "rank0").iterdir()
+                         if p.suffix == ".bin")
+            entry.write_bytes(entry.read_bytes()[:-1] + b"\0")
+            with self.assertRaisesRegex(eb.ExecBankError, "checksum"):
+                eb.read_rank_bank(str(Path(tmp) / "bank"), digest_dir, 0)
+            bundle = eb.read_rank_bank(str(self.root / "bank"), digest_dir, 0)
+            name = next(iter(bundle["files"]))
+            bundle["files"][name] = bundle["files"][name][:-1] + b"\0"
+            with self.assertRaisesRegex(eb.ExecBankError, "checksum"):
+                eb.install_rank_bank(str(Path(tmp) / "other"), bundle, {})
+            self.assertFalse((Path(tmp) / "other" / digest_dir / "rank0").exists())
 
     def test_read_round_trip_skips_trace_lower_compile(self):
         out = _run("read", self.root)
@@ -607,14 +653,24 @@ class IdentityTests(unittest.TestCase):
 
         base = eb.digest(identity()["instance"])
         self.assertEqual(base, eb.digest(identity()["instance"]))
-        swapped = {**payload, "runtime_env": {**payload["runtime_env"],
-                                              "TPU_PROCESS_ADDRESSES": "10.0.0.2:8471,10.0.0.1:8471"}}
-        for variant in (identity(blocks=284), identity(runner(num_seqs=256)), identity(p=swapped),
+        for variant in (identity(blocks=284), identity(runner(num_seqs=256)),
                         identity(env={"XLA_FLAGS": "--xla_foo=1"})):
             self.assertNotEqual(base, eb.digest(variant["instance"]))
+        # Other hosts (a congruent placement) or another host order: same bank, placement recorded.
+        for addresses in ("10.0.0.2:8471,10.0.0.1:8471", "10.0.9.7:8471,10.0.9.8:8471"):
+            moved = identity(p={**payload, "runtime_env": {**payload["runtime_env"],
+                                                            "TPU_PROCESS_ADDRESSES": addresses}})
+            self.assertEqual(base, eb.digest(moved["instance"]))
+            self.assertEqual(identity()["rank"], moved["rank"])
+            self.assertEqual(moved["placement"]["host_order"],
+                             [a.rsplit(":", 1)[0] for a in addresses.split(",")])
         rank = identity()["rank"]
         self.assertEqual(rank["process_index"], 0)
-        self.assertIn("process_count", identity()["instance"]["parallel"])
+        self.assertEqual(len(rank["local_device_coords"]), len(rank["local_device_ids"]))
+        parallel = identity()["instance"]["parallel"]
+        self.assertIn("process_count", parallel)
+        self.assertNotIn("host_order", parallel)
+        self.assertIn("value", parallel["topology_fingerprint"])
         self.assertIn("platform_version", identity()["instance"]["runtime"])
 
     def test_engine_settings_validate_exec_bank(self):

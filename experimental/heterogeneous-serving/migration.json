@@ -41,8 +41,8 @@
     },
     {
       "path": "hetero/exec_bank.py",
-      "sha256": "22bb036db41226f36e4a8960221b305f600932c7a2cf466bd023ef62c511d11a",
-      "bytes": 38179
+      "sha256": "e1b4bbd1a50cde0331d4fea9c2051d61b426450d5ddb2df531a4454eb0e7d4b5",
+      "bytes": 45674
     },
     {
       "path": "hetero/preread.py",
@@ -111,8 +111,13 @@
     },
     {
       "path": "tests/test_exec_bank.py",
-      "sha256": "d5876faac3b40013093961869a691530d51cec48f15061635197e61590a56a87",
-      "bytes": 32005
+      "sha256": "fdaa24a597ce0ede9496668734d4afa37664aa328e9b49889d19baf8476ac74e",
+      "bytes": 35636
+    },
+    {
+      "path": "tests/test_portable_bank.py",
+      "sha256": "ce828796f7d0405b52da99ef0b9e268f128c22d0edfddac3dab407b0ab725aad",
+      "bytes": 4742
     },
     {
       "path": "tests/test_preread.py",
