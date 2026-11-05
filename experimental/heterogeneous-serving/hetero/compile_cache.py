@@ -8,6 +8,7 @@ def configure_compile_cache(runtime_env):
     for env, option, convert in (
         ("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "jax_persistent_cache_min_compile_time_secs", float),
         ("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "jax_persistent_cache_min_entry_size_bytes", int),
+        ("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES", "jax_persistent_cache_enable_xla_caches", str),
         ("JAX_LOG_COMPILES", "jax_log_compiles", _boolean),
         ("JAX_EXPLAIN_CACHE_MISSES", "jax_explain_cache_misses", _boolean),
     ):

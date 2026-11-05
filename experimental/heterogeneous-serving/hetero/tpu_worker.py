@@ -50,6 +50,7 @@ EVIDENCE_ENV_KEYS = (
     "VLLM_XLA_CACHE_PATH",
     "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
     "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+    "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES",
     "JAX_LOG_COMPILES",
     "JAX_EXPLAIN_CACHE_MISSES",
     "VLLM_ENABLE_V1_MULTIPROCESSING",
@@ -203,6 +204,7 @@ class HeteroTPUWorker(TPUWorker):
             report["compilation_cache_dir"] = jax.config.jax_compilation_cache_dir
             report["persistent_cache_min_compile_time_secs"] = jax.config.jax_persistent_cache_min_compile_time_secs
             report["persistent_cache_min_entry_size_bytes"] = jax.config.jax_persistent_cache_min_entry_size_bytes
+            report["persistent_cache_enable_xla_caches"] = jax.config.jax_persistent_cache_enable_xla_caches
             report["jax_version"] = jax.__version__
             report["trace_options"] = ({"python_tracer_level": options.python_tracer_level,
                                          "host_tracer_level": options.host_tracer_level} if trace else None)
@@ -312,6 +314,18 @@ class HeteroTPUWorker(TPUWorker):
             except BaseException:
                 self._omp_kill_preread("release gate aborted")
                 raise
+        state_gate_s = float(payload.get("state_gate_timeout_s") or 0.0)
+        if state_gate_s:
+            # Autoscale boot overlap: the startup state is still being fetched onto this host.
+            # Wait before the first device touch: device init can already compile, and JAX's
+            # cache put writes non-atomically into the directory the fetch is filling.
+            from .state_delivery import marker_path, wait_marker
+
+            self._omp_state_gate = self._timed(
+                "state_gate", wait_marker,
+                marker_path(payload["weight_snapshot_root"], payload["layout_id"], payload["instance_id"],
+                            process_rank),
+                timeout_s=state_gate_s)
         try:
             result = self._timed("init_device", super().init_device, *args, **kwargs)
         except BaseException:
@@ -369,7 +383,7 @@ class HeteroTPUWorker(TPUWorker):
                 / f"rank{self.omp_process_rank}")
 
     def _snapshot_context(self):
-        from .weight_snapshot import model_identity
+        from .weight_snapshot import model_identity, relative_chip_coords
         payload = self._hetero_payload()
         config = self.vllm_config.model_config
         return {
@@ -379,8 +393,9 @@ class HeteroTPUWorker(TPUWorker):
             "quantization": getattr(config, "quantization", None),
             "backend_revision": payload["backend_revision"],
             "runtime_revision": payload["runtime_revision"],
-            "host_ips": payload["host_ips"],
-            "chip_coords_by_host": payload["chip_coords_by_host"],
+            # Placement-independent, like the exec bank identity: host addresses never enter, so a
+            # snapshot copied rank for rank onto a congruent placement restores there.
+            "chip_coords_by_rank": relative_chip_coords(payload["host_ips"], payload["chip_coords_by_host"]),
         }
 
     def omp_snapshot_weights(self, generation=None):
@@ -739,6 +754,7 @@ class HeteroTPUWorker(TPUWorker):
                 **({"normal_load": self._omp_normal_load} if "_omp_normal_load" in self.__dict__ else {}),
                 **({"prespawn_gate": self._omp_prespawn_gate} if "_omp_prespawn_gate" in self.__dict__
                    else {}),
+                **({"state_gate": self._omp_state_gate} if "_omp_state_gate" in self.__dict__ else {}),
                 **({"preread": self._omp_preread} if "_omp_preread" in self.__dict__ else {}),
                 "exec_bank": (self._omp_exec_bank.report() if "_omp_exec_bank" in self.__dict__
                               else {"mode": None}),
@@ -748,6 +764,7 @@ class HeteroTPUWorker(TPUWorker):
                     "dir": cache_dir,
                     "min_compile_time_secs": jax.config.jax_persistent_cache_min_compile_time_secs,
                     "min_entry_size_bytes": jax.config.jax_persistent_cache_min_entry_size_bytes,
+                    "enable_xla_caches": jax.config.jax_persistent_cache_enable_xla_caches,
                     "log_compiles": jax.config.jax_log_compiles,
                     "explain_cache_misses": jax.config.jax_explain_cache_misses,
                     "writer_process_id": distributed.global_state.process_id,

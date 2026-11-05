@@ -191,6 +191,21 @@ def model_identity(model):
         'hash_kind': 'config-content-and-checkpoint-size-mtime'}
 
 
+def relative_chip_coords(host_ips, chip_coords_by_host):
+    """Each rank's chips (rank = position in ``host_ips``) relative to the instance origin, sorted.
+
+    Congruent placements (same chip box, same relative host grid) give the same value whatever
+    their host addresses or absolute coordinates; this is the snapshot's placement identity.
+    """
+    hosts = list(host_ips)
+    coords = [[[int(v) for v in c] for c in chip_coords_by_host[h]] for h in hosts]
+    every = [c for rank in coords for c in rank]
+    if not every:
+        raise SnapshotRefused('instance has no chips')
+    origin = [min(c[a] for c in every) for a in range(len(every[0]))]
+    return [sorted([v - o for v, o in zip(c, origin)] for c in rank) for rank in coords]
+
+
 def _devices(mesh):
     return [{'id': int(d.id), 'process_index': int(d.process_index),
              'platform': d.platform} for d in mesh.devices.flat]
