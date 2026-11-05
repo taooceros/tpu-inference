@@ -41,8 +41,10 @@ def cheap_tracer_sharding_errors():
     ``rngs.params()`` counter update, so ``nnx.eval_shape`` of a model with N
     parameters costs O(N^2) equation walks: ~13 s of a 14 s build for the
     1028-parameter Gemma-4-31B graph on one CPU host. jax 0.11 dropped the
-    origin message from this property; this restores that behaviour for the
-    duration of the block only.
+    origin message from this property (jax/_src/core.py ``Tracer.sharding``), so on
+    jax 0.11.2 this block installs a property with the same message and the same
+    exception type: behavior-identical and harmless. The flag stays; the property
+    is swapped for the duration of the block only.
     """
     from jax._src import core
 

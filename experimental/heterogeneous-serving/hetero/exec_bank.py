@@ -14,15 +14,18 @@ installed. A bucket miss or a ``Compiled`` signature rejection (raised before
 execution) takes the original jit path and is counted; never a partial mix of
 banked and unbanked ranks.
 
-Installed tpu_inference call sites (md5-identical to the fork at 8d31f0866):
-  run_model      models/common/model_loader.py:375-391 (closure cell
-                 ``jitted_model_fn`` of ``wrapped_model_fn`` :467-471)
-  compute_logits model_loader.py:412, runner attribute tpu_runner.py:1203
-  sample, compute_and_gather_logprobs  layers/jax/sample/sampling.py:105,154;
-                 module globals of tpu_runner.py:62-65, compilation_manager.py:33-34
-  compute_and_gather_prompt_logprobs   sampling.py:165 (global used by :197)
-  select_from_array    tpu_runner.py:2262-2264 (staticmethod -> instance attr)
-  substitute_placeholder_token  tpu_runner.py:535, attribute :844
+Installed tpu_inference call sites (tpu-inference 672546d8, vLLM 273a04964 image; the old
+v0.26.0 closure cell ``jitted_model_fn`` no longer exists):
+  run_model      models/common/model_loader.py: ``wrapped_model_fn`` :505 -> ``_resolve_step_fn``
+                 :500 -> ``_get_step_fn`` :405, which builds the step jit lazily through the
+                 closure function ``_wrap_with_jit`` :382 (cache ``_step_fns`` :403); the cell
+                 ``_wrap_with_jit`` is replaced so the options-carrying jit is banked on creation
+  compute_logits model_loader.py:448, runner attribute tpu_runner.py:1281
+  sample, compute_and_gather_logprobs  layers/jax/sample/sampling.py:327,421;
+                 module globals of tpu_runner.py:61-64, compilation_manager.py:35-37
+  compute_and_gather_prompt_logprobs   sampling.py:432 (global used by :532)
+  select_from_array    tpu_runner.py:2385-2387 (staticmethod -> instance attr)
+  substitute_placeholder_token  tpu_runner.py:561, attribute :839
   structured_decode    structured_decoding_manager.py:33 (bound, static self)
 """
 from __future__ import annotations
@@ -68,8 +71,6 @@ JAX_CONFIG_KEYS = (
     "jax_default_prng_impl",
     "jax_optimization_level",
     "jax_memory_fitting_level",
-    "jax_exec_time_optimization_effort",
-    "jax_memory_fitting_effort",
 )
 
 
@@ -739,11 +740,43 @@ def _closure_cell(fn, name):
 
 
 class Installation:
-    """Replaces runner jit callables with BankedFunctions; ``restore`` undoes it."""
+    """Replaces runner jit callables with BankedFunctions; ``restore`` undoes it.
+
+    ``run_model`` is the one lazily created function: tpu_inference builds its step jit on the
+    first call, keyed by the KV caches' shardings (``model_loader._get_step_fn``), so the
+    BankedFunction is created then. ``capture`` and ``tables`` (loaded entries) are applied to it
+    at that moment.
+    """
+
+    LAZY = frozenset({"run_model"})
 
     def __init__(self):
         self.functions: Dict[str, BankedFunction] = {}
+        self.capture = False
+        self.tables: Dict[str, Dict[str, Any]] = {}
+        self.unbanked_step_fns = 0
+        self._step_cache: Optional[dict] = None
         self._undo: list = []
+
+    def known(self) -> frozenset:
+        return frozenset(self.functions) | self.LAZY
+
+    def set_capture(self, capture: bool) -> None:
+        self.capture = capture
+        for banked in self.functions.values():
+            banked.capture = capture
+
+    def load_table(self, fn_id: str, table: Dict[str, Any]) -> None:
+        if fn_id in self.functions:
+            self.functions[fn_id].load(table)
+        else:
+            self.tables[fn_id] = table
+
+    def adopt(self, banked: BankedFunction) -> None:
+        banked.capture = self.capture
+        if banked.fn_id in self.tables:
+            banked.load(self.tables[banked.fn_id])
+        self.functions[banked.fn_id] = banked
 
     def add(self, banked: BankedFunction, sites: Iterable[tuple]) -> None:
         """sites: (kind, owner, name) with kind in attr|global|cell."""
@@ -765,12 +798,54 @@ class Installation:
                 setattr(owner, name, banked)
             else:
                 raise ValueError(kind)
-        self.functions[banked.fn_id] = banked
+        self.adopt(banked)
+
+    def install_step_fn_wrapper(self, model_fn) -> None:
+        """Bank the options-carrying step jit that ``model_fn`` (``wrapped_model_fn``) dispatches to.
+
+        ``model_loader.get_flax_model`` builds that jit lazily in ``_get_step_fn`` through the
+        closure function ``_wrap_with_jit``; the cell holding it is replaced by a wrapper that
+        banks the jit it returns. The options-free twin (``step_fn_no_options``, used only by
+        ``continue_decode``) is left alone. Step jits already cached are wrapped in place.
+        """
+        resolve = _closure_cell(model_fn, "_resolve_step_fn").cell_contents
+        get_step_fn = _closure_cell(resolve, "_get_step_fn").cell_contents
+        wrap_cell = _closure_cell(get_step_fn, "_wrap_with_jit")
+        cache = _closure_cell(get_step_fn, "_step_fns").cell_contents
+        self._step_cache = cache
+        original_wrap = wrap_cell.cell_contents
+
+        def bank_step_fn(jitted):
+            if "run_model" in self.functions:  # a second KV sharding set: not bankable
+                self.unbanked_step_fns += 1
+                return jitted
+            if not hasattr(jitted, "lower"):
+                raise ExecBankError("run_model is not a jax.jit function")
+            banked = BankedFunction("run_model", jitted, jitted, invariant_argnums=(0, 1))
+            self.adopt(banked)
+            return banked
+
+        def wrap_with_jit(fn, kv_cache_shardings, **jit_kwargs):
+            jitted = original_wrap(fn, kv_cache_shardings, **jit_kwargs)
+            return bank_step_fn(jitted) if "compiler_options" in jit_kwargs else jitted
+
+        self._undo.append(lambda c=wrap_cell, p=original_wrap: setattr(c, "cell_contents", p))
+        wrap_cell.cell_contents = wrap_with_jit
+        for key, jitted in list(cache.items()):
+            if key[0]:  # with_options
+                cache[key] = bank_step_fn(jitted)
+                self._undo.append(lambda d=cache, k=key, p=jitted: d.__setitem__(k, p))
 
     def restore(self) -> None:
         while self._undo:
             self._undo.pop()()
+        if self._step_cache is not None:  # step jits created while installed hold BankedFunctions
+            for key, value in list(self._step_cache.items()):
+                if isinstance(value, BankedFunction):
+                    self._step_cache[key] = value.original
+            self._step_cache = None
         self.functions.clear()
+        self.tables.clear()
 
 
 def install_runner(runner, modules: Dict[str, Any]) -> Installation:
@@ -782,10 +857,7 @@ def install_runner(runner, modules: Dict[str, Any]) -> Installation:
                                             modules["sampling"])
     inst = Installation()
     try:
-        cell = _closure_cell(runner.model_fn, "jitted_model_fn")
-        run_model = cell.cell_contents
-        inst.add(BankedFunction("run_model", run_model, run_model, invariant_argnums=(0, 1)),
-                 [("cell", cell, None)])
+        inst.install_step_fn_wrapper(runner.model_fn)
         logits = runner.compute_logits_fn
         inst.add(BankedFunction("compute_logits", logits, logits, invariant_argnums=(0,)),
                  [("attr", runner, "compute_logits_fn")])
@@ -844,7 +916,7 @@ class _CaptureProxy:
 
 
 def patch_run_compilation(manager, counters: Counter):
-    """Wrap ``CompilationManager._run_compilation`` (compilation_manager.py:126-196).
+    """Wrap ``CompilationManager._run_compilation`` (compilation_manager.py:150-224).
 
     Banked hit: skip lower and compile; the warm-up task (unless compile_only)
     still executes through the BankedFunction. Capture (write mode): the
@@ -859,7 +931,7 @@ def patch_run_compilation(manager, counters: Counter):
     def run(name, fn, *args, call_kwargs=None, warmup_handler=None, aot=True,
             compile_only=False, **kwargs):
         call_kwargs = dict(call_kwargs or {})
-        while isinstance(fn, functools.partial):  # as compilation_manager.py:139-142
+        while isinstance(fn, functools.partial):  # as compilation_manager.py:163-166
             args = fn.args + args
             call_kwargs = {**fn.keywords, **call_kwargs}
             fn = fn.func
@@ -924,7 +996,7 @@ class WorkerBank:
             raise
         self.installation = installation
         self.status["installed"] = True
-        self.status["functions_installed"] = sorted(installation.functions)
+        self.status["functions_installed"] = sorted(installation.known())
         return installation
 
     def deactivate(self) -> None:
@@ -946,15 +1018,13 @@ class WorkerBank:
         except ExecBankError as exc:
             self.status["write_error"] = f"install: {exc}"
             return
-        for banked in installation.functions.values():
-            banked.capture = True
+        installation.set_capture(True)
 
     def finish_capture(self, identity_fn: Callable[[], Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if self.installation is None:
             return None
         functions = list(self.installation.functions.values())
-        for banked in functions:
-            banked.capture = False
+        self.installation.set_capture(False)
         identity = identity_fn()
         self.status["identity_digest"] = digest(identity["instance"])
         self.status["identity"] = identity
@@ -976,11 +1046,11 @@ class WorkerBank:
                 raise ExecBankError(f"sabotaged (exec_bank_sabotage_rank={self.sabotage_rank})")
             loaded = load_bank(self.root, identity)
             installation = self._activate(runner, modules)
-            unknown = set(loaded["tables"]) - set(installation.functions)
+            unknown = set(loaded["tables"]) - installation.known()
             if unknown:
                 raise ExecBankError(f"bank has functions this runner cannot install: {sorted(unknown)}")
             for fn_id, table in loaded["tables"].items():
-                installation.functions[fn_id].load(table)
+                installation.load_table(fn_id, table)
             vote["entry_set_digest"] = loaded["entry_set_digest"]
             self.status["loaded"] = {k: loaded[k] for k in
                                      ("path", "entries", "entry_set_digest", "load_s", "written_nonce",
@@ -1002,4 +1072,6 @@ class WorkerBank:
     def report(self) -> Dict[str, Any]:
         functions = ({fn_id: b.report() for fn_id, b in self.installation.functions.items()}
                      if self.installation is not None else {})
-        return {**self.status, "run_compilation": dict(self.counters), "functions": functions}
+        return {**self.status, "run_compilation": dict(self.counters), "functions": functions,
+                "unbanked_step_fns": (self.installation.unbanked_step_fns
+                                      if self.installation is not None else 0)}

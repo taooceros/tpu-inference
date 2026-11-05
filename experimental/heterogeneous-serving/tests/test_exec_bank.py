@@ -2,19 +2,20 @@
 
 The jax scenarios run this file as a script in fresh interpreters (write, then
 read), so a bank is always produced and consumed by different processes. The
-fake runner reproduces the installed tpu_inference call shapes (md5-identical
-to the fork at 8d31f0866):
+fake runner reproduces the installed tpu_inference call shapes (tpu-inference
+672546d8, the jax 0.11.2 image):
 
-* ``run_model``: jit with donate_argnums=1 and static (4, 5, 6), reached via a
-  non-jit ``wrapped_model_fn`` closure (models/common/model_loader.py:375-391, 467-471);
-* ``compute_logits_fn`` jit on (state_leaves, hidden) (model_loader.py:412);
+* ``run_model``: jit with donate_argnums=1 and static (4, 5, 6), built lazily per KV-sharding
+  key by ``_wrap_with_jit`` and reached via the non-jit ``wrapped_model_fn`` ->
+  ``_resolve_step_fn`` -> ``_get_step_fn`` closures (models/common/model_loader.py:371-515);
+* ``compute_logits_fn`` jit on (state_leaves, hidden) (model_loader.py:448);
 * ``sample`` static_argnames=["mesh"] and ``compute_and_gather_*logprobs``
-  static max_logprobs as module globals (layers/jax/sample/sampling.py:105,154,165);
-* ``_select_from_array_fn`` staticmethod jit static (2, 3) (runner/tpu_runner.py:2262-2264);
-* ``_substitute_placeholder_token_fn`` donate (0, 1, 2) (tpu_runner.py:535);
+  static max_logprobs as module globals (layers/jax/sample/sampling.py:327,421,432);
+* ``_select_from_array_fn`` staticmethod jit static (2, 3) (runner/tpu_runner.py:2385-2387);
+* ``_substitute_placeholder_token_fn`` donate (0, 1, 2) (tpu_runner.py:561);
 * ``structured_decode_fn`` jitted method, static self (runner/structured_decoding_manager.py:33);
 * ``FakeCompilationManager._run_compilation`` / ``_flush_compilations`` copy
-  runner/compilation_manager.py:126-229 (partial unwrap, compile_only, AOT
+  runner/compilation_manager.py:150-252 (partial unwrap, compile_only, AOT
   lower on the caller, compile in a thread pool, warm-up after the flush).
 """
 import functools
@@ -79,9 +80,7 @@ def _jax_setup():
     mesh = Mesh(np.array([[by_id[i] for i in (0, 1, 4, 5, 2, 3, 6, 7)]]), ("data", "model"))
     col, rep = NamedSharding(mesh, P(None, "model")), NamedSharding(mesh, P())
 
-    @functools.partial(jax.jit, out_shardings=([col] * LAYERS, rep), donate_argnums=1,
-                       static_argnums=(4, 5, 6))
-    def run_model(state_leaves, kv_caches, input_ids, md, layer_map, is_first, is_last):
+    def run_model_impl(state_leaves, kv_caches, input_ids, md, layer_map, is_first, is_last):
         h = state_leaves[0][input_ids % VOCAB]
         new_kv = []
         for i in range(LAYERS):
@@ -91,10 +90,33 @@ def _jax_setup():
             h = h * 2.0
         return new_kv, h + len(layer_map)
 
-    def make_model_fn(jitted_model_fn):
-        def wrapped_model_fn(*args, **kwargs):  # model_loader.py:467-471
+    def make_model_fn():
+        """Mirrors model_loader.get_flax_model (tpu-inference 672546d8): ``wrapped_model_fn`` ->
+        ``_resolve_step_fn`` -> ``_get_step_fn`` caches one jit per KV-sharding key, built by
+        ``_wrap_with_jit``; with_options False is the continue_decode twin."""
+        _step_fns = {}
+
+        def _wrap_with_jit(fn, kv_cache_shardings, **jit_kwargs):
+            return jax.jit(fn, out_shardings=(kv_cache_shardings, rep), donate_argnums=1,
+                           static_argnums=(4, 5, 6), **jit_kwargs)
+
+        def _get_step_fn(kv_caches, with_options):
+            shardings = jax.tree.map(lambda c: c.sharding, kv_caches)
+            key = (with_options, tuple(jax.tree.leaves(shardings)))
+            fn = _step_fns.get(key)
+            if fn is None:
+                options = {"compiler_options": {}} if with_options else {}
+                fn = _wrap_with_jit(run_model_impl, shardings, **options)
+                _step_fns[key] = fn
+            return fn
+
+        def _resolve_step_fn(kv_caches, with_options):
+            return _get_step_fn(kv_caches, with_options)
+
+        def wrapped_model_fn(*args, **kwargs):
             kwargs.pop("shared_attention_metadata", None)
-            return jitted_model_fn(*args, **kwargs)
+            return _resolve_step_fn(args[1], True)(*args, **kwargs)
+
         return wrapped_model_fn
 
     @functools.partial(jax.jit, out_shardings=rep)
@@ -239,7 +261,7 @@ def _jax_setup():
                 jax.device_put(jax.random.normal(jax.random.fold_in(k, i), (HIDDEN, HIDDEN)) * 0.1, col)
                 for i in range(LAYERS)]
             self.kv_caches = self.fresh_kv()
-            self.model_fn = make_model_fn(run_model)
+            self.model_fn = make_model_fn()
             self.compute_logits_fn = run_compute_logits
             self._substitute_placeholder_token_fn = substitute
             self.structured_decoding_manager = StructuredDecodingManager()

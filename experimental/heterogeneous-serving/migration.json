@@ -41,28 +41,28 @@
     },
     {
       "path": "hetero/exec_bank.py",
-      "sha256": "e1b4bbd1a50cde0331d4fea9c2051d61b426450d5ddb2df531a4454eb0e7d4b5",
-      "bytes": 45674
+      "sha256": "cee3beacf089982a291c0bbf56400ae6ac8b975bcafff6532259c57bf6e20fd5",
+      "bytes": 49293
     },
     {
       "path": "hetero/preread.py",
-      "sha256": "316f6bfb8a9bcc18e0c29debf443975136dad3d8ddddd59bea47c9fae0cc1149",
-      "bytes": 36429
+      "sha256": "b1735b8fc793747bb68e4e4192add72ab55662749475f101fa8185ecfbfa0c9e",
+      "bytes": 36861
     },
     {
       "path": "hetero/prespawn.py",
-      "sha256": "c551d84846941b42f630819dde76f707e00ee1194cff33ef2d9b704459ed872f",
-      "bytes": 15505
+      "sha256": "f63d00ac15aa8b2c35ea4f35e3fa5ef755e33aaf975262b7750b1df08f9f63aa",
+      "bytes": 15521
     },
     {
       "path": "hetero/restore_graph.py",
-      "sha256": "777d9d8f5c5ac5e6a4ce13973c9a07a30cb914028c406265af42059e2379136d",
-      "bytes": 6404
+      "sha256": "5e9f9a04d16246013b71fbf6cfe18324bf424a995e7a27daaabb403663c1e00a",
+      "bytes": 6594
     },
     {
       "path": "hetero/tpu_worker.py",
-      "sha256": "4d4e66550895018f7fd4d1f1c4069011dee3fe2650c0b7734aead1000f1ec6bb",
-      "bytes": 59407
+      "sha256": "a2e68e442996a61b648483ea950508509d74fd7906fb0f02a01979aa1828158b",
+      "bytes": 59621
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -91,8 +91,8 @@
     },
     {
       "path": "tests/preread_ref_worker.py",
-      "sha256": "aa1feddd72cb954ee675d7c4946a6fa476c1ff0616d2656066ccd5a288a2fb96",
-      "bytes": 4908
+      "sha256": "f0997453cd24a94d6410b0bcd26c9743f7bdab714251c345b7f870a878fd7423",
+      "bytes": 4929
     },
     {
       "path": "tests/preread_support.py",
@@ -111,8 +111,8 @@
     },
     {
       "path": "tests/test_exec_bank.py",
-      "sha256": "fdaa24a597ce0ede9496668734d4afa37664aa328e9b49889d19baf8476ac74e",
-      "bytes": 35636
+      "sha256": "ad4a397290d58a0cb9c6d46cb3837577dde5ab4735a368aafc71f8994eb20dad",
+      "bytes": 36667
     },
     {
       "path": "tests/test_portable_bank.py",
@@ -131,13 +131,13 @@
     },
     {
       "path": "tests/test_restore_graph.py",
-      "sha256": "26bb7f21aec5576213f899671e582fec4992cfcd3b17013fa1b21fa076e56eec",
-      "bytes": 6447
+      "sha256": "f3c9e2bc34afa26d9dce80029a11d3cc0459667a0b3399a21106f897229c102e",
+      "bytes": 7318
     },
     {
       "path": "tests/test_restore_tail_worker.py",
-      "sha256": "4fc368f9f68d8decb97342289623758b57af9c672c02463720a2022a3af8e8e0",
-      "bytes": 11976
+      "sha256": "a5f4337ef576fd5f508468884da3098c824431d509f45169b829084effc234b9",
+      "bytes": 14178
     },
     {
       "path": "tests/test_weight_snapshot.py",

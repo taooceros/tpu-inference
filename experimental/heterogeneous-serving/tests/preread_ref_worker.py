@@ -83,7 +83,7 @@ else:
 
     def snapshot_builder(model_class, cfg, rng, mesh_, pooler=None, is_draft_model=False):
         with jax.set_mesh(mesh_):
-            abstract = nnx.eval_shape(lambda: model_class(cfg, rng, mesh_))
+            abstract = nnx.eval_shape(lambda: model_class(cfg, rng, mesh_), graph_updates=False)
         validate_tree(nnx.state(abstract), mesh_, prepared)
         restored = restore(nnx.state(abstract), mesh_, prepared, clocks)
         nnx.update(abstract, restored)

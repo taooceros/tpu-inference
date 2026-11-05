@@ -1,11 +1,14 @@
 """Placement from the manifest before the abstract graph exists; verify/build overlap."""
 import copy
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +67,8 @@ class RestoreGraphTests(unittest.TestCase):
         self.assertEqual(arrays, [])
 
     def test_placement_refuses_wrong_shard_devices_before_transfer(self):
+        if jax.device_count() < 2:  # shard 0 and shard -1 would share one device id
+            self.skipTest('needs >=2 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)')
         prepared = prepare(self.directory, self.context, self.mesh, {})
         manifest = copy.deepcopy(prepared[0])
         manifest['arrays'][0]['shards'][0]['device_id'] = manifest['arrays'][0]['shards'][-1]['device_id']
@@ -108,17 +113,30 @@ class RestoreGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(SnapshotRefused, 'checksum mismatch'):
             build_while_verifying(lambda: 'graph', verify)
 
-    def test_tracer_sharding_probe_skips_origin_walk_inside_block_only(self):
+    def test_tracer_sharding_probe_matches_unpatched_jax_0112(self):
+        """jax 0.11.2 already omits the origin walk, so the patch is behavior-identical.
+
+        Inside the block and outside it, ``getattr(tracer, 'sharding', None)`` must not call
+        ``_origin_msg`` and must raise the same AttributeError text; the property is swapped
+        only for the duration of the block.
+        """
         from jax._src import core
         from jax._src.interpreters import partial_eval
 
         walks = []
+        messages = []
         original_origin = partial_eval.DynamicJaxprTracer._origin_msg
         partial_eval.DynamicJaxprTracer._origin_msg = lambda self: walks.append(1) or ''
         try:
             def probe():
                 # Fresh closure each call: jax caches traces per function object.
-                return lambda x: jnp.zeros(()) if getattr(x + 1, 'sharding', None) is None else x
+                def fn(x):
+                    try:
+                        (x + 1).sharding
+                    except AttributeError as exc:
+                        messages.append(str(exc))
+                    return x
+                return fn
 
             before = core.Tracer.__dict__['sharding']
             with cheap_tracer_sharding_errors():
@@ -127,7 +145,9 @@ class RestoreGraphTests(unittest.TestCase):
                 self.assertIsNot(core.Tracer.__dict__['sharding'], before)
             self.assertIs(core.Tracer.__dict__['sharding'], before)
             jax.eval_shape(probe(), jnp.zeros((2,)))
-            self.assertEqual(walks, [1])
+            self.assertEqual(walks, [])
+            self.assertEqual(len(messages), 2)
+            self.assertEqual(messages[0], messages[1])
         finally:
             partial_eval.DynamicJaxprTracer._origin_msg = original_origin
 

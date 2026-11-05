@@ -427,7 +427,8 @@ class HeteroTPUWorker(TPUWorker):
         try:
             directory = (Path(payload["weight_snapshot_root"]) / ".preread" / payload["layout_id"]
                          / payload["instance_id"] / f"rank{self.omp_process_rank}")
-            table = device_table(payload)
+            table = device_table(payload, device_indexes=getattr(
+                getattr(self.vllm_config, "sharding_config", None), "device_indexes", None))
             spec = write_spec(directory, vllm_config=self.vllm_config, rank=self.omp_process_rank,
                               table=table, out_dir=str(self._snapshot_location()),
                               generation=payload["weight_snapshot_generation"],
@@ -536,7 +537,8 @@ class HeteroTPUWorker(TPUWorker):
                     raise SnapshotRefused("draft/quantized snapshot graph construction is unsupported")
                 with jax.set_mesh(mesh):
                     abstract = self._timed("graph_build", nnx.eval_shape,
-                                           lambda: model_class(config, rng, mesh))
+                                           lambda: model_class(config, rng, mesh),
+                                           graph_updates=False)  # as model_loader._get_nnx_model
                 self._timed("graph_validate", validate_tree, nnx.state(abstract), mesh, prepared)
             except Exception as exc:
                 problem = str(exc)
@@ -990,9 +992,9 @@ class HeteroTPUWorker(TPUWorker):
 
 
 # Normal-loader weight conversion/placement functions, timed by _checkpoint_clock (tpu_inference @
-# 8d31f0866): models/jax/utils/weight_utils.py:742 jax_array_from_reshaped_torch (torch reshape/permute
+# 672546d8): models/jax/utils/weight_utils.py:759 jax_array_from_reshaped_torch (torch reshape/permute
 # + t2j on the JAX CPU backend; the safetensors tensors are lazy mmaps, so the checkpoint bytes are read
-# here, as page faults) and :769 assign_and_shard_param (shard_put -> make_array_from_callback: local
+# here, as page faults) and :786 assign_and_shard_param (shard_put -> make_array_from_callback: local
 # shard selection on the host + H2D).  layers/jax/quantization/unquantized.py:42 imports both by name.
 _LOADER_HOOKS = (("tpu_inference.models.jax.utils.weight_utils", "jax_array_from_reshaped_torch", "host_convert_s"),
                  ("tpu_inference.models.jax.utils.weight_utils", "assign_and_shard_param", "shard_place_s"),
