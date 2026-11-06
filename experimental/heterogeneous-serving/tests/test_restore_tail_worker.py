@@ -5,12 +5,15 @@ tpu_inference and ray are stubbed at module level; the restore path itself
 runs for real on eight host devices.
 """
 import json
+import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import jax
 import jax.numpy as jnp
@@ -19,8 +22,51 @@ from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
+def _stub_load_model(self):
+    loader_mod = sys.modules["tpu_inference.models.common.model_loader"]
+    runner = self.model_runner
+    model = loader_mod._get_nnx_model(runner.model_class, runner.vllm_config,
+                                      runner.rng_key, runner.mesh)
+    runner.state = nnx.state(model)
+
+
+def _stub_initialize_from_config(self, kv_cache_config):
+    manager = self.model_runner.compilation_manager
+    manager._precompile_sampling()
+    manager._precompile_gather_logprobs()
+    manager._flush_compilations()
+    self.model_runner.initialize_kv_cache(kv_cache_config, 0)
+
+
+def _normal_builder(model_class, vllm_config, rng, mesh, **_):
+    # Mirrors model_loader._get_nnx_model: eval_shape of the constructor, and
+    # records whether Tracer.sharding was the patched property while tracing.
+    from jax._src import core
+    loader_mod = sys.modules["tpu_inference.models.common.model_loader"]
+    loader_mod.saw_patched_property = core.Tracer.__dict__["sharding"] is not loader_mod.original_property
+    with jax.set_mesh(mesh):
+        return nnx.eval_shape(lambda: model_class(vllm_config, rng, mesh), graph_updates=False)
+
+
+def _real_stack():
+    """The installed tpu_inference worker and loader modules, or None (CPU venv without them)."""
+    try:
+        import tpu_inference.worker.tpu_worker as worker_mod
+        import tpu_inference.models.common.model_loader as loader_mod
+    except ImportError:
+        return None
+    return worker_mod, loader_mod
+
+
 def _install_stubs():
-    if "tpu_inference.worker.tpu_worker" in sys.modules:
+    """Without tpu_inference, stub ``tpu_inference`` and ray in ``sys.modules`` (import time).
+
+    With the real package (the jax 0.11.2 image venv) nothing is touched here: pytest imports
+    every test module before running any, so production classes are patched only inside
+    ``setUpModule`` / ``tearDownModule`` (``_patch_real_stack``).
+    """
+    from jax._src import core as _core
+    if _real_stack() is not None:
         return
     try:
         import ray  # noqa: F401
@@ -34,41 +80,43 @@ def _install_stubs():
     models_pkg = types.ModuleType("tpu_inference.models")
     common_pkg = types.ModuleType("tpu_inference.models.common")
     loader_mod = types.ModuleType("tpu_inference.models.common.model_loader")
-
-    class TPUWorker:
-        def load_model(self):
-            runner = self.model_runner
-            model = loader_mod._get_nnx_model(runner.model_class, runner.vllm_config,
-                                              runner.rng_key, runner.mesh)
-            runner.state = nnx.state(model)
-
-        def initialize_from_config(self, kv_cache_config):
-            manager = self.model_runner.compilation_manager
-            manager._precompile_sampling()
-            manager._precompile_gather_logprobs()
-            manager._flush_compilations()
-            self.model_runner.initialize_kv_cache(kv_cache_config, 0)
-
-    worker_mod.TPUWorker = TPUWorker
-
-    def normal_builder(model_class, vllm_config, rng, mesh, **_):
-        # Mirrors model_loader._get_nnx_model: eval_shape of the constructor, and
-        # records whether Tracer.sharding was the patched property while tracing.
-        from jax._src import core
-        loader_mod.saw_patched_property = core.Tracer.__dict__["sharding"] is not loader_mod.original_property
-        with jax.set_mesh(mesh):
-            return nnx.eval_shape(lambda: model_class(vllm_config, rng, mesh))
-
-    from jax._src import core as _core
+    worker_mod.TPUWorker = type("TPUWorker", (), {
+        "load_model": _stub_load_model, "initialize_from_config": _stub_initialize_from_config})
     loader_mod.original_property = _core.Tracer.__dict__["sharding"]
     loader_mod.saw_patched_property = None
-    loader_mod._get_nnx_model = normal_builder
+    loader_mod._get_nnx_model = _normal_builder
     for name, module in (("tpu_inference", pkg), ("tpu_inference.worker", worker_pkg),
                          ("tpu_inference.worker.tpu_worker", worker_mod),
                          ("tpu_inference.models", models_pkg),
                          ("tpu_inference.models.common", common_pkg),
                          ("tpu_inference.models.common.model_loader", loader_mod)):
         sys.modules[name] = module
+
+
+_REAL_UNDO = []
+
+
+def _patch_real_stack():
+    """``HeteroTPUWorker`` subclasses the real ``TPUWorker``; replace only ``load_model``,
+    ``initialize_from_config`` and ``model_loader._get_nnx_model`` (the TPU-only parts)."""
+    from jax._src import core as _core
+    stack = _real_stack()
+    if stack is None:
+        return
+    worker_mod, loader_mod = stack
+    saved = (worker_mod.TPUWorker.load_model, worker_mod.TPUWorker.initialize_from_config,
+             loader_mod._get_nnx_model)
+    worker_mod.TPUWorker.load_model = _stub_load_model
+    worker_mod.TPUWorker.initialize_from_config = _stub_initialize_from_config
+    loader_mod._get_nnx_model = _normal_builder
+    loader_mod.original_property = _core.Tracer.__dict__["sharding"]
+    loader_mod.saw_patched_property = None
+
+    def undo():
+        (worker_mod.TPUWorker.load_model, worker_mod.TPUWorker.initialize_from_config,
+         loader_mod._get_nnx_model) = saved
+        del loader_mod.original_property, loader_mod.saw_patched_property
+    _REAL_UNDO.append(undo)
 
 
 def core_property():
@@ -80,6 +128,16 @@ _install_stubs()
 
 from hetero.tpu_worker import HeteroTPUWorker  # noqa: E402
 from hetero.weight_snapshot import snapshot  # noqa: E402
+
+
+def setUpModule():
+    _patch_real_stack()
+
+
+def tearDownModule():
+    while _REAL_UNDO:
+        _REAL_UNDO.pop()()
+
 
 uniform = nnx.initializers.uniform()
 
@@ -212,8 +270,10 @@ class RestoreTailWorkerTests(unittest.TestCase):
                                   _flush_compilations=lambda: calls.append("flush"))
         worker.model_runner.compilation_manager = manager
         worker.model_runner.initialize_kv_cache = lambda cfg, order: calls.append(("kv", cfg, order))
-        worker.initialize_from_config("cfg")
-        self.assertEqual(calls, ["sampling", "logprobs", "flush", ("kv", "cfg", 0)])
+        kv_cache_config = SimpleNamespace(num_blocks=7)
+        worker.initialize_from_config(kv_cache_config)
+        self.assertEqual(calls, ["sampling", "logprobs", "flush", ("kv", kv_cache_config, 0)])
+        self.assertEqual(worker._omp_kv_num_blocks, 7)
         clocks = worker._omp_phase_clocks
         for key in ("precompile_sampling", "precompile_gather_logprobs", "precompile_flush",
                     "kv_cache_allocate", "initialize_from_config"):

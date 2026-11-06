@@ -5,8 +5,8 @@ source engines still own the TPUs on the same hosts.  Its placement group carrie
 resource and its worker actors request none (``prespawn_executor_class``), so Ray schedules it
 next to the source.  Everything up to ``HeteroTPUWorker.init_device``'s ``super().init_device()``
 -- imports, vLLM config, executor and worker construction -- runs during the source phase; the
-first device touch is ``jax.devices()`` in tpu_inference/worker/tpu_worker.py:410 (installed
-v0.26.0).  Each worker parks right before it (``park_and_wait``) on a named ``ReleaseGate`` actor
+first device touch is ``jax.devices()`` in tpu_inference/worker/tpu_worker.py:411 (tpu-inference
+672546d8).  Each worker parks right before it (``park_and_wait``) on a named ``ReleaseGate`` actor
 keyed by its node IP.  The controller releases a host after the source engine on it has been
 drained and its placement group removed; the worker then waits, bounded, until no other process
 holds libtpu's lockfile (``/tmp/libtpu_lockfile``; libtpu takes a POSIX write lock on it at
@@ -288,8 +288,8 @@ def bundles_sorted_by_node_any_device(placement_group) -> List[Tuple[int, str, s
     """vllm ``get_bundles_sorted_by_node`` without its device-key filter.
 
     The installed version keeps only bundles that carry ``ray_device_key`` (vllm
-    v1/executor/ray_utils.py:429-432), so a CPU-only group yields no worker ranks and
-    RayExecutorV2 fails at ``bundle_assignments[0]`` (ray_executor_v2.py:330).  Same order as the
+    v1/executor/ray_utils.py:430-432), so a CPU-only group yields no worker ranks and
+    RayExecutorV2 fails on the empty ``bundle_assignments`` (ray_executor_v2.py:315-330).  Same order as the
     original: driver node first, then by node id, stable in bundle index (ray_utils.py:434-440),
     so pre-spawned ranks land exactly where a normal deploy puts them.
     """
@@ -309,7 +309,7 @@ def prespawn_executor_class(base: type) -> type:
     """``base`` (tpu_inference RayDistributedExecutorV2) whose worker actors request no TPU.
 
     The stock override returns ``{"num_gpus": 0, "resources": {"TPU": bundle TPU}}``
-    (tpu_inference/executors/ray_distributed_executor_v2.py:135-145); with a CPU-only bundle
+    (tpu_inference/executors/ray_distributed_executor_v2.py:138-148); with a CPU-only bundle
     that is ``TPU: 0``, which Ray 2.56 rejects ("not a supported chip configuration").  A TPU-free
     actor also gets ``get_accelerator_ids()["TPU"] == []`` and Ray leaves the TPU_* env alone;
     HeteroTPUWorker.init_device writes the instance's TPU env before the device init anyway.

@@ -65,7 +65,8 @@ def _bounds(value: str) -> tuple:
     return parts + (1,) * (3 - len(parts))
 
 
-def device_table(payload: Dict[str, Any], *, device_kind: str = "TPU v5 lite") -> Dict[str, Any]:
+def device_table(payload: Dict[str, Any], *, device_kind: str = "TPU v5 lite",
+                 device_indexes: Any = None) -> Dict[str, Any]:
     """The TPU mesh the runner will build, derived from the instance payload alone (no JAX backend).
 
     Device identity:
@@ -76,18 +77,21 @@ def device_table(payload: Dict[str, Any], *, device_kind: str = "TPU v5 lite") -
       ``TPU_PROCESS_ADDRESSES`` order (checked by the worker).
     - ``jax.devices()`` is ordered by ``(process_index, id)``.
 
-    Mesh, as tpu_inference @ 8d31f0866 builds it:
+    Mesh, as tpu_inference @ 672546d8 builds it:
     - ``runner/tpu_runner.py`` ``_create_2d_mesh``: shape ``(model_dp_size, tp_size)`` = ``(1, tp)``,
       axes ``('data', 'model')``.
     - ``utils.make_optimized_mesh``: devices sorted by coords, then ``jax.make_mesh``.
     - ``jax.make_mesh`` is ``mesh_utils.create_device_mesh`` with ``allow_split_physical_axes`` set
       for v5 lite.
 
-    Refused (never guessed): ``NEW_MODEL_DESIGN``, data parallelism, or a payload whose topology
-    disagrees with its chip coordinates.
+    Refused (never guessed): ``NEW_MODEL_DESIGN``, data parallelism, a payload whose topology
+    disagrees with its chip coordinates, or explicit ``sharding_config.device_indexes`` (the
+    runner then builds an unsorted ``Mesh`` in the given order, not ``make_optimized_mesh``).
     """
     from jax._src import mesh_utils
 
+    if device_indexes is not None and len(device_indexes) > 0:
+        raise ValueError("explicit sharding device_indexes meshes are not derived here")
     if os.environ.get("NEW_MODEL_DESIGN", "").lower() in ("1", "true"):
         raise ValueError("NEW_MODEL_DESIGN meshes are not derived here")
     env = payload["runtime_env"]
@@ -582,14 +586,15 @@ def run(spec: Dict[str, Any], audit: _Audit, sampler: _Sampler) -> Dict[str, Any
 
         def builder(model_class, config, rng, mesh_, pooler=None, is_draft_model=False):
             # tpu_inference _get_nnx_model, load_format 'auto', LoadableWithIterator branch
-            # (model_loader.py:247-285 @ 8d31f0866) up to create_jit_model, which needs devices.
+            # (model_loader.py:247-285 @ 672546d8) up to create_jit_model, which needs devices.
             if (is_draft_model or pooler is not None or config.model_config.quantization is not None
                     or config.load_config.load_format in ("dummy", "jax_dummy", "pathways_dummy")
                     or model_loader.apply_qwix_on_abstract_model(config)
                     or getattr(model_class, "_self_manages_sharding", False)):
                 raise RuntimeError("only the plain checkpoint loader path is pre-read")
             with clock("graph_build"), jax.set_mesh(mesh_):
-                model = nnx.eval_shape(lambda: model_class(config, rng, mesh_))
+                model = nnx.eval_shape(lambda: model_class(config, rng, mesh_),
+                                       graph_updates=False)  # as model_loader._get_nnx_model
             if not isinstance(model, model_loader.LoadableWithIterator):
                 raise RuntimeError(f"{model_class.__name__} does not load with an iterator")
             paths, values, numbers = state_leaves(model)
