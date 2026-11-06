@@ -18,7 +18,8 @@ class CompileCacheConfig(unittest.TestCase):
     def setUp(self):
         options = ("jax_persistent_cache_min_compile_time_secs",
                    "jax_persistent_cache_min_entry_size_bytes", "jax_log_compiles",
-                   "jax_explain_cache_misses")
+                   "jax_explain_cache_misses", "jax_persistent_cache_enable_xla_caches",
+                   "jax_compilation_cache_dir")
         old = {key: getattr(jax.config, key) for key in options}
         self.addCleanup(lambda: [jax.config.update(key, value) for key, value in old.items()])
 
@@ -60,9 +61,28 @@ class CompileCacheConfig(unittest.TestCase):
             for instance in resolve_layout(inventory(), builtin_layout(layout_id)).instances:
                 expected = configure_compile_cache(instance.process_env(0))
                 self.assertEqual(expected, {"jax_persistent_cache_min_compile_time_secs": 0.0,
-                                            "jax_persistent_cache_min_entry_size_bytes": 0})
+                                            "jax_persistent_cache_min_entry_size_bytes": 0,
+                                            "jax_persistent_cache_enable_xla_caches": "none"})
                 self.assertEqual((jax.config.jax_persistent_cache_min_compile_time_secs,
                                   jax.config.jax_persistent_cache_min_entry_size_bytes), (0.0, 0))
+
+    def test_layout_env_keeps_the_cache_directory_out_of_compile_options(self):
+        # JAX hashes CompileOptions into the persistent-cache key; at the default
+        # enable_xla_caches it embeds <cache dir>/xla_gpu_per_fusion_autotune_cache_dir there
+        # (and 0.10.x does not clear it), so a cache copied to another path never hits.
+        from jax._src import compiler
+        from hetero.layout import PERSISTENT_CACHE_THRESHOLD_ENV
+
+        def autotune_dir(cache_dir):
+            jax.config.update("jax_compilation_cache_dir", cache_dir)
+            options = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+            return options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir
+
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+            self.assertNotEqual(autotune_dir(a), autotune_dir(b))  # the default: path in every key
+            configure_compile_cache(PERSISTENT_CACHE_THRESHOLD_ENV)
+            self.assertEqual((autotune_dir(a), autotune_dir(b)), ("", ""))
 
 
 class CoverageMatchedAcceptance(unittest.TestCase):
