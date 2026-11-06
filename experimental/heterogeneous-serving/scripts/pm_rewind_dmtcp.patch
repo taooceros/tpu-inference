@@ -1,0 +1,48 @@
+--- a/src/writeckpt.cpp
++++ b/src/writeckpt.cpp
+@@ -517,6 +517,29 @@
+     }
+   }
+ 
++  // A loader reservation may map a regular file wholly past EOF.  Its
++  // PROT_NONE pages have no readable contents, even after adding PROT_READ.
++  // Preserve the original file/address/offset rather than replacing it with
++  // anonymous zeros (which would lose SIGBUS after a later mprotect).
++  if (area.prot == PROT_NONE && (area.flags & MAP_PRIVATE) &&
++      !(area.flags & MAP_ANONYMOUS) && area.name[0] == '/') {
++    struct stat guardStat = {0};
++    if (stat(area.name, &guardStat) == 0 && S_ISREG(guardStat.st_mode) &&
++        area.offset >= guardStat.st_size) {
++      // The existing parent header maps the backing file without payload.
++      // A zero child header only restores protection; it neither reads nor
++      // writes the mapping.  Together these preserve the file-backed guard
++      // using the existing checkpoint format and unmodified restart reader.
++      area.mmapFileSize = 0;
++      area.properties |= DMTCP_ZERO_PAGE_PARENT_HEADER;
++      writeAreaHeader(fd, &area);
++      area.properties &= ~DMTCP_ZERO_PAGE_PARENT_HEADER;
++      area.properties |= DMTCP_ZERO_PAGE_CHILD_HEADER | DMTCP_ZERO_PAGE;
++      writeAreaHeader(fd, &area);
++      return;
++    }
++  }
++
+   /* If the area didn't have read permissions, add it temporarily.
+    *
+    * NOTE: Changing the permission here can results in two adjacent memory
+@@ -559,9 +582,13 @@
+     // actually written here. This is because fd might be a pipe to gzip.
+     if (area.mmapFileSize > 0) {
+       JASSERT(Util::writeAll(fd, area.addr, area.mmapFileSize) ==
+-              (ssize_t)area.mmapFileSize);
++              (ssize_t)area.mmapFileSize)
++        (JASSERT_ERRNO) (area.name) ((void*)area.addr)
++        (area.offset) (area.size) (area.mmapFileSize);
+     } else {
+-      JASSERT(Util::writeAll(fd, area.addr, area.size) == (ssize_t)area.size);
++      JASSERT(Util::writeAll(fd, area.addr, area.size) == (ssize_t)area.size)
++        (JASSERT_ERRNO) (area.name) ((void*)area.addr)
++        (area.offset) (area.size) (area.mmapFileSize);
+     }
+   }
+ 

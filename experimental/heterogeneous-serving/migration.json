@@ -90,6 +90,41 @@
       "bytes": 1515
     },
     {
+      "path": "scripts/pm_rewind.py",
+      "sha256": "e2a4355d07261741645ae55cf46128f5509fb9b44dacbd6f55f648b7792b924d",
+      "bytes": 37515
+    },
+    {
+      "path": "scripts/pm_rewind_dmtcp.patch",
+      "sha256": "f7ec636cf6929f270be292e241f824f48336575830a0c6e36da13c3078bb1f21",
+      "bytes": 2134
+    },
+    {
+      "path": "scripts/pm_rewind_dmtcp_pid.patch",
+      "sha256": "ee2fc93ec28d6d056e4df6ca00a92c06e9d24dfe155d8331c62e3b52d271bd6a",
+      "bytes": 3538
+    },
+    {
+      "path": "scripts/pm_rewind_native.py",
+      "sha256": "1b14a41ab3f77ff1049617c4cd25e51be2c758c5dc193920946a32d34d175e21",
+      "bytes": 11497
+    },
+    {
+      "path": "scripts/pm_rewind_probe.py",
+      "sha256": "71f89e86f8891ee5b5c2b0dd681bfc8cf937e358e34ce33aa32c0cfb82a554ab",
+      "bytes": 17924
+    },
+    {
+      "path": "scripts/pm_rewind_ray.py",
+      "sha256": "95e03e1a21deaee1c2a7810a273ebde8809547d9eeaa9beed2ef304d6f626c12",
+      "bytes": 24646
+    },
+    {
+      "path": "scripts/pm_rewind_ray_probe.py",
+      "sha256": "1a633eb74eb7a9af9e9ea4cbcaa27c38b635c8be0de654e63e24ab3b4da0accd",
+      "bytes": 61019
+    },
+    {
       "path": "tests/preread_ref_worker.py",
       "sha256": "aa1feddd72cb954ee675d7c4946a6fa476c1ff0616d2656066ccd5a288a2fb96",
       "bytes": 4908
