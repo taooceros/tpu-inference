@@ -35,6 +35,11 @@
       "bytes": 1505
     },
     {
+      "path": "hetero/compile_execution_smoke.py",
+      "sha256": "83823a7dd1dc2a37980bcca393a1d8873933bebf603ecb8245cd9285733890a3",
+      "bytes": 17868
+    },
+    {
       "path": "hetero/compile_overlap.py",
       "sha256": "4a8f0eb46b8cc56ccce3506e2363ebbb17c0a8ef4cc7ab80cdc7eae4cf17f922",
       "bytes": 13311
@@ -43,6 +48,21 @@
       "path": "hetero/exec_bank.py",
       "sha256": "e1b4bbd1a50cde0331d4fea9c2051d61b426450d5ddb2df531a4454eb0e7d4b5",
       "bytes": 45674
+    },
+    {
+      "path": "hetero/ici_executor.py",
+      "sha256": "8c1dd136425af6acf53b59144d9e0ed07a34963cc7996c2cd8cb34cd4bd50a4b",
+      "bytes": 2777
+    },
+    {
+      "path": "hetero/ici_resident.py",
+      "sha256": "797434975a54350315e3e902f74866b9a18fe437aa69101fa7815931d790edac",
+      "bytes": 8539
+    },
+    {
+      "path": "hetero/ici_worker.py",
+      "sha256": "939e706d1e56f137eebbf72ebebf7810bd212948b0dc75de02a6fdfccfa30902",
+      "bytes": 11475
     },
     {
       "path": "hetero/preread.py",
@@ -63,6 +83,61 @@
       "path": "hetero/tpu_worker.py",
       "sha256": "4d4e66550895018f7fd4d1f1c4069011dee3fe2650c0b7734aead1000f1ec6bb",
       "bytes": 59407
+    },
+    {
+      "path": "hetero/unified_runtime.py",
+      "sha256": "e61ac3e266a74536dfb7d2872440089e1ffcf78d1325bef25de2aa0ebe0792c4",
+      "bytes": 73979
+    },
+    {
+      "path": "hetero/vproc/__init__.py",
+      "sha256": "6bac1103be4c16b5255a684f5f65bfd27949f61a3121e45edb37d5168efa170a",
+      "bytes": 97
+    },
+    {
+      "path": "hetero/vproc/catalog.py",
+      "sha256": "b68be2bba17a7bcdc910f3fe75647aa0e4f8548f90e9a27676df98bfde7dec1b",
+      "bytes": 5782
+    },
+    {
+      "path": "hetero/vproc/controller.py",
+      "sha256": "8523178b1b8be4a93a3c0b899e4490e2e42e5fd77c28f0c9ffda4910208a57fa",
+      "bytes": 60774
+    },
+    {
+      "path": "hetero/vproc/cpu_block.py",
+      "sha256": "7ac8de52611c5ac58b5e6dbdc1274776a415bd1408084039ce6358649da9a2e6",
+      "bytes": 7009
+    },
+    {
+      "path": "hetero/vproc/host_kernel.py",
+      "sha256": "83689780d736aa230e76c64d913ece35313ef563dc5d54a01056b8c6fe97634d",
+      "bytes": 19938
+    },
+    {
+      "path": "hetero/vproc/measure.py",
+      "sha256": "431e42cf9db8c5d578a4d7e2c9612bc5b957765899415e2f97e26700958def10",
+      "bytes": 15537
+    },
+    {
+      "path": "hetero/vproc/resident.py",
+      "sha256": "35b8eefb5ccf61a5ae3ab634e532c944b19e79ea185e7dbb291fa6eb438b23a8",
+      "bytes": 36132
+    },
+    {
+      "path": "hetero/vproc/synthetic_engine.py",
+      "sha256": "0a7179281e771fc70693fdc96832c1d771d0dcb9afd75d49d8ad263241e562a4",
+      "bytes": 17147
+    },
+    {
+      "path": "hetero/vproc/types.py",
+      "sha256": "66eea61f821c042d8f4348827e07b51cff8ba1518436ac05e308807e52581253",
+      "bytes": 12487
+    },
+    {
+      "path": "hetero/vproc/view.py",
+      "sha256": "9f81c91973da559dd711e1714be1ad31c4a7954182835c5a15b0fbdc96c34fa7",
+      "bytes": 17131
     },
     {
       "path": "hetero/weight_snapshot.py",
@@ -115,6 +190,11 @@
       "bytes": 35636
     },
     {
+      "path": "tests/test_ici_resident.py",
+      "sha256": "8e7c4954b4556aa19d25a0b4a989d400c5e9f54df7238ac4bdb6f99d81a614f9",
+      "bytes": 7419
+    },
+    {
       "path": "tests/test_portable_bank.py",
       "sha256": "ce828796f7d0405b52da99ef0b9e268f128c22d0edfddac3dab407b0ab725aad",
       "bytes": 4742
@@ -138,6 +218,51 @@
       "path": "tests/test_restore_tail_worker.py",
       "sha256": "4fc368f9f68d8decb97342289623758b57af9c672c02463720a2022a3af8e8e0",
       "bytes": 11976
+    },
+    {
+      "path": "tests/test_unified_runtime.py",
+      "sha256": "6710cf4870933cc0588ca2065c82e277b164867e9d7d1591c5433255ddff8ed5",
+      "bytes": 12472
+    },
+    {
+      "path": "tests/test_vproc_block_ray.py",
+      "sha256": "52180ebd98ee90646f70d4da582f3779b67c0faf0cefe0b0a207d502ee8b6a49",
+      "bytes": 6787
+    },
+    {
+      "path": "tests/test_vproc_catalog.py",
+      "sha256": "551fba24dd83ae4de30490a0d0aeb4f7e59d72822ab5152a8126c7c690472b7f",
+      "bytes": 2510
+    },
+    {
+      "path": "tests/test_vproc_controller.py",
+      "sha256": "9fb06f343477bb7d2feee2f9521ff5c77db344dc24512b16514cc1e468eef1d8",
+      "bytes": 60516
+    },
+    {
+      "path": "tests/test_vproc_cpu_block.py",
+      "sha256": "e452e2f436b3b09d8a504cc5488cb07e950903e4601bcdb9dc78f21311d94d5f",
+      "bytes": 3652
+    },
+    {
+      "path": "tests/test_vproc_host_kernel.py",
+      "sha256": "de4fc22dddea2bb5d560b787c73d6ddbcb00095dc3910f831cb508ad5764abaf",
+      "bytes": 15025
+    },
+    {
+      "path": "tests/test_vproc_layout_switch_worker.py",
+      "sha256": "6d17044505c52f607c88cbfc57adc3718e7470e567b76e6c607d1f484ceca69f",
+      "bytes": 33034
+    },
+    {
+      "path": "tests/test_vproc_resident.py",
+      "sha256": "3eeff69c6d44b43d8791fd956cbe0bc5e045de16a0edf6bc2538e010248dd81c",
+      "bytes": 21806
+    },
+    {
+      "path": "tests/test_vproc_view.py",
+      "sha256": "21effd51bd6938defe78c4f2a0837813c73d6888699c6cfdd3c2d229a28b7af9",
+      "bytes": 28826
     },
     {
       "path": "tests/test_weight_snapshot.py",
